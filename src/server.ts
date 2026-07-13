@@ -731,6 +731,7 @@ export class KiCADMcpServer {
       // DRC and export operations need longer timeouts for large boards
       let commandTimeout = 30000; // Default 30 seconds
       const longRunningCommands = [
+        "autoroute",
         "run_drc",
         "export_gerber",
         "export_pdf",
@@ -742,6 +743,15 @@ export class KiCADMcpServer {
       ];
       if (longRunningCommands.includes(command)) {
         commandTimeout = 600000; // 10 minutes for long operations
+        // Freerouting accepts a timeout in seconds. Keep the Node-side
+        // watchdog longer than that value so a valid long autoroute is not
+        // killed by the MCP transport first.
+        if (command === "autoroute") {
+          const requestedTimeout = Number(params?.timeout);
+          if (Number.isFinite(requestedTimeout) && requestedTimeout > 0) {
+            commandTimeout = Math.max(commandTimeout, Math.ceil(requestedTimeout * 1000) + 30000);
+          }
+        }
         logger.info(`Using extended timeout (${commandTimeout / 1000}s) for command: ${command}`);
       }
 

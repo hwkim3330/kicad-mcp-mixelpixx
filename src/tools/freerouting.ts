@@ -8,6 +8,28 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 export function registerFreeroutingTools(server: McpServer, callKicadScript: Function) {
+  server.tool(
+    "native_autoroute",
+    "Java-free native autoroute using the Rust-accelerated KiCadRoutingTools A* engine. Routes only explicit targetNets, runs KiCad DRC, and refuses to replace the board when routing is incomplete or strict DRC fails.",
+    {
+      boardPath: z.string().optional(),
+      routerPath: z.string().optional().describe("Path to KiCadRoutingTools/route.py (default: ~/.kicad-mcp/KiCadRoutingTools/route.py)"),
+      pythonExecutable: z.string().optional(),
+      targetNets: z.array(z.string()).min(1).describe("Explicit net names to route"),
+      timeout: z.number().optional().describe("Router timeout in seconds (default: 300)"),
+      gridStep: z.number().optional().describe("A* grid step in mm (default: 0.05)"),
+      clearance: z.number().optional().describe("Routing clearance in mm (default: 0.15)"),
+      maxIterations: z.number().int().optional().describe("Maximum A* iterations per route"),
+      layers: z.array(z.string()).optional().describe("Copper layers, e.g. ['F.Cu','B.Cu']"),
+      strictDrc: z.boolean().optional().describe("Reject any DRC violation or unconnected item (default: true)"),
+      apply: z.boolean().optional().describe("Apply only after routing and DRC pass (default: true)"),
+    },
+    async (args: any) => {
+      const result = await callKicadScript("native_autoroute", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
   // Full autoroute: export DSN -> run Freerouting -> import SES
   //
   // Best-of-N support (the `attempts` / `targetNets` / `passSchedule`

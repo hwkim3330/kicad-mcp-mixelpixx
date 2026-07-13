@@ -646,6 +646,7 @@ class KiCADInterface(SchematicHandlersMixin):
             "add_symbol_property": add_symbol_property,
             # Freerouting autoroute commands
             "autoroute": self.freerouting_commands.autoroute,
+            "native_autoroute": self.freerouting_commands.native_autoroute,
             "export_dsn": self.freerouting_commands.export_dsn,
             "import_ses": self.freerouting_commands.import_ses,
             "check_freerouting": self.freerouting_commands.check_freerouting,

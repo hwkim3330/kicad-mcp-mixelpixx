@@ -480,7 +480,7 @@ class KiCADServer {
 
         // Reject the promise
         reject(new Error(`Command timeout: ${request.command}`));
-      }, 30000); // 30 seconds timeout
+      }, request.timeout ?? 30000);
 
       // Write the request to the Python process
       console.error(`Sending request: ${requestStr}`);

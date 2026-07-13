@@ -680,6 +680,151 @@ class FreeroutingCommands:
             response["best_ses_path"] = best_ses_path
         return response
 
+    def native_autoroute(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Route selected nets with the Java-free Rust A* KiCad router.
+
+        KiCadRoutingTools edits a copy of the native PCB file directly.  The
+        result is applied only when the router reports every requested net
+        complete and (by default) KiCad DRC reports no violations.  This
+        prevents a partial route from replacing a known-good board.
+        """
+        board_path = params.get("boardPath") or (self.board.GetFileName() if self.board else "")
+        if not board_path or not os.path.isfile(board_path):
+            return {"success": False, "message": "Board file not found", "errorDetails": board_path}
+
+        router = params.get("routerPath") or os.environ.get(
+            "KICAD_NATIVE_ROUTER",
+            os.path.join(os.path.expanduser("~"), ".kicad-mcp", "KiCadRoutingTools", "route.py"),
+        )
+        if not os.path.isfile(router):
+            return {
+                "success": False,
+                "message": "Java-free native router not installed",
+                "errorDetails": "Set KICAD_NATIVE_ROUTER to KiCadRoutingTools/route.py",
+            }
+        python_exe = params.get("pythonExecutable") or os.environ.get(
+            "KICAD_NATIVE_ROUTER_PYTHON",
+            os.path.join(os.path.expanduser("~"), ".kicad-mcp", "native-route-venv", "bin", "python"),
+        )
+        if not os.path.isfile(python_exe):
+            python_exe = shutil.which("python3") or python_exe
+
+        nets = [str(net) for net in (params.get("targetNets") or [])]
+        if not nets:
+            return {
+                "success": False,
+                "message": "targetNets is required",
+                "errorDetails": "Use explicit nets for safe incremental routing",
+            }
+        timeout = float(params.get("timeout", 300))
+        clearance = float(params.get("clearance", 0.15))
+        grid_step = float(params.get("gridStep", 0.05))
+        max_iterations = int(params.get("maxIterations", 300000))
+        strict_drc = bool(params.get("strictDrc", True))
+        apply = bool(params.get("apply", True))
+
+        temp_dir = tempfile.mkdtemp(prefix="kicad-native-route-")
+        output_path = os.path.join(temp_dir, Path(board_path).name)
+        cmd = [
+            python_exe,
+            router,
+            board_path,
+            output_path,
+            "--nets",
+            *nets,
+            "--overwrite",
+            "--grid-step",
+            str(grid_step),
+            "--clearance",
+            str(clearance),
+            "--max-iterations",
+            str(max_iterations),
+        ]
+        if params.get("layers"):
+            cmd.extend(["--layers", *[str(layer) for layer in params["layers"]]])
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=os.path.dirname(router),
+            )
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return {"success": False, "message": f"Native router timed out after {timeout}s"}
+        except Exception as exc:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return {"success": False, "message": "Native router failed to start", "errorDetails": str(exc)}
+
+        summary = {}
+        for line in reversed((proc.stdout or "").splitlines()):
+            if line.startswith("JSON_SUMMARY:"):
+                try:
+                    summary = json.loads(line.split("JSON_SUMMARY:", 1)[1].strip())
+                except json.JSONDecodeError:
+                    pass
+                break
+        failed = int(summary.get("failed", 1))
+        routed = set(summary.get("routed_single", []))
+        failed_names = {item.get("net_name") for item in summary.get("failed_multipoint", [])}
+        route_complete = proc.returncode == 0 and failed == 0 and not (failed_names & set(nets))
+        if not route_complete:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return {
+                "success": False,
+                "message": "Native routing did not complete every requested net",
+                "summary": summary,
+                "stdout": (proc.stdout or "")[-2000:],
+                "stderr": (proc.stderr or "")[-1000:],
+            }
+
+        drc = {"violations": [], "unconnected_items": []}
+        kicad_cli = shutil.which("kicad-cli") or "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"
+        drc_path = os.path.join(temp_dir, "drc.json")
+        if os.path.isfile(kicad_cli):
+            drc_proc = subprocess.run(
+                [kicad_cli, "pcb", "drc", "--format", "json", "--output", drc_path, output_path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if os.path.isfile(drc_path):
+                try:
+                    with open(drc_path, "r", encoding="utf-8") as handle:
+                        drc = json.load(handle)
+                except (OSError, json.JSONDecodeError):
+                    pass
+            if drc_proc.returncode != 0 and not drc.get("violations"):
+                drc["tool_error"] = drc_proc.stderr[-1000:]
+
+        violation_count = len(drc.get("violations", []))
+        unconnected_count = len(drc.get("unconnected_items", []))
+        if strict_drc and (violation_count or unconnected_count):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return {
+                "success": False,
+                "message": "Native route rejected by strict DRC",
+                "summary": summary,
+                "drc": {"violations": violation_count, "unconnected_items": unconnected_count},
+            }
+
+        if apply:
+            backup_path = f"{board_path}.native-route-backup"
+            shutil.copy2(board_path, backup_path)
+            os.replace(output_path, board_path)
+        result = {
+            "success": True,
+            "message": "Java-free native autoroute completed",
+            "applied": apply,
+            "reloadRequired": apply,
+            "summary": summary,
+            "drc": {"violations": violation_count, "unconnected_items": unconnected_count},
+        }
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return result
+
     def export_dsn(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Export the board to Specctra DSN format only."""
         try:
