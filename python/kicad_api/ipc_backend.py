@@ -17,6 +17,7 @@ Key Benefits over SWIG:
 import logging
 import os
 import platform
+import glob
 import threading
 import time
 from pathlib import Path
@@ -84,6 +85,13 @@ class IPCBackend(KiCADBackend):
                 # Common socket locations (Unix-like systems only)
                 # Windows uses named pipes, handled by auto-detect
                 if platform.system() != "Windows":
+                    # KiCad 10 creates a per-editor socket alongside the
+                    # manager socket. Prefer those sockets so API requests
+                    # such as GetOpenDocuments are handled by pcbnew rather
+                    # than by the project manager process.
+                    socket_paths_to_try.extend(
+                        f"ipc://{path}" for path in sorted(glob.glob("/tmp/kicad/api-*.sock"))
+                    )
                     socket_paths_to_try.append("ipc:///tmp/kicad/api.sock")  # Linux default
                     # XDG runtime directory (requires getuid, Unix only)
                     if hasattr(os, "getuid"):
