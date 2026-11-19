@@ -43,10 +43,131 @@ round-trip, so a formatter change can never corrupt schematic data.
 from __future__ import annotations
 
 import logging
+import re
 
 import sexpdata
+from utils.paren_match import match_paren, paren_delta  # noqa: F401 (re-export)
 
 logger = logging.getLogger("kicad_interface")
+
+
+# ---------------------------------------------------------------------------
+# Quoted-value escaping (#336)
+# ---------------------------------------------------------------------------
+#
+# KiCad double-quoted tokens escape a backslash as ``\\`` and a quote as
+# ``\"``. Code that reads them with the obvious ``"([^"]*)"`` stops at the
+# FIRST quote character, including an escaped one -- so a value containing
+# ``\"`` is silently truncated and left ending in a lone backslash. Emitting
+# that back out escapes the closing quote, the token runs on, and the rest of
+# the file is swallowed.
+#
+# Both halves of the pair matter, and so does their ORDER: escaping quotes
+# without escaping backslashes first is a no-op on exactly the values that
+# break.
+#
+# Line breaks are escaped too, as ``\n`` and ``\r``, the way KiCad's own writer
+# (OUTPUTFORMATTER::Quotes) does. KiCad's lexer reads a file line by line, so
+# a raw newline inside a quoted token leaves the string unterminated. In the
+# root schematic that fails the load ("Failed to load schematic"). In a
+# sub-sheet it is silent: eeschema and kicad-cli leave the whole sheet out of
+# the design, kicad-cli still exits 0, and ERC reports nothing.
+
+#: Matches one KiCad double-quoted token, capturing the raw (still-escaped)
+#: contents. Use with :func:`unescape_sexpr_string` on the captured group.
+QUOTED_VALUE = r'"((?:[^"\\]|\\.)*)"'
+
+#: Same match, capturing nothing. Use this to *skip* a quoted token in a
+#: pattern that has later positional groups — substituting the capturing form
+#: shifts every subsequent group index, which fails silently rather than
+#: loudly (a coordinate group starts returning a property value).
+QUOTED_VALUE_SKIP = r'"(?:[^"\\]|\\.)*"'
+
+
+# ---------------------------------------------------------------------------
+# String-aware structure walking
+# ---------------------------------------------------------------------------
+#
+# Tools that edit KiCad files as text need to know where a list ends without
+# re-serializing the file. Counting parens is not enough: a Description of
+# ``"Ceramic (X7R) 50V"`` or a footprint named ``HRS_U.FL-R-SMT-1(10)`` puts
+# unbalanced parens inside quoted tokens, and real libraries contain both.
+#
+# ``match_paren`` and ``paren_delta`` skip quoted text, so callers can slice
+# a block out of a file and splice a new one back without a parser. They live
+# in ``utils.paren_match`` (no third-party imports, so ``utils.kicad_dru`` can
+# load under KiCad's own Python) and are re-exported here.
+
+
+def iter_child_offsets(block: str, depth: int = 2):
+    """Yield the offset of every list nested *depth* levels inside *block*.
+
+    *block* starts at its own ``(``, which is depth 1, so the default yields
+    its direct children. Depth is counted structurally rather than from
+    indentation: KiCad's own writers emit files whose indentation does not
+    always match nesting.
+    """
+    current = 0
+    in_string = False
+    i = 0
+    while i < len(block):
+        ch = block[i]
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "(":
+            current += 1
+            if current == depth:
+                yield i
+        elif ch == ")":
+            current -= 1
+        i += 1
+
+
+# The four characters KiCad's writer escapes. A tab is written as it is.
+_ESCAPES = str.maketrans({"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r"})
+
+# What KiCad's lexer (DSNLEXER) decodes after a backslash. Any other character
+# keeps its backslash, as in KiCad. KiCad also reads octal and \x escapes,
+# which its writer never produces; those are left as they are.
+_UNESCAPES = {
+    "\\": "\\",
+    '"': '"',
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "a": "\a",
+    "b": "\b",
+    "f": "\f",
+    "v": "\v",
+}
+_ESCAPE_SEQUENCE = re.compile(r"\\(.)", re.DOTALL)
+
+
+def escape_sexpr_string(value: str) -> str:
+    """Escape a string for insertion into a KiCad double-quoted token.
+
+    Backslash, quote, line feed and carriage return, exactly as KiCad writes
+    them. Done in one pass, so the backslash an escape adds is never escaped
+    again.
+    """
+    return value.translate(_ESCAPES)
+
+
+def unescape_sexpr_string(value: str) -> str:
+    """Decode a quoted token's contents the way KiCad reads them.
+
+    One left-to-right pass: chained replacements would read the escaped
+    backslash in ``C:\\\\new`` (the path ``C:\\new``) as a backslash followed
+    by the escape ``\\n``, and turn it into a line break.
+    """
+    return _ESCAPE_SEQUENCE.sub(lambda m: _UNESCAPES.get(m.group(1), m.group(0)), value)
+
 
 # Formatting constants, mirrored from KiCad's Prettify().
 _QUOTE_CHAR = '"'

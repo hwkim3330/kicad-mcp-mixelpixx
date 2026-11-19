@@ -15,9 +15,15 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from commands.library_tables import (
+    global_table_path,
+    no_global_table_message,
+    project_library_uri,
+)
+from utils.sexpr_format import escape_sexpr_string, match_paren, paren_delta
+
 logger = logging.getLogger("kicad_interface")
 
-KICAD9_FORMAT_VERSION = "20250114"  # .kicad_sch schematic files
 KICAD9_FOOTPRINT_VERSION = "20241229"  # .kicad_mod footprint files
 
 
@@ -261,13 +267,13 @@ class FootprintCreator:
                 # Detect start of target pad
                 if re.match(rf'\(pad\s+"{re.escape(pad_number)}"\s+', stripped):
                     in_target_pad = True
-                    pad_depth = stripped.count("(") - stripped.count(")")
+                    pad_depth = paren_delta(stripped)
                     pad_block_lines = [line]
                 else:
                     result_lines.append(line)
             else:
                 pad_block_lines.append(line)
-                pad_depth += stripped.count("(") - stripped.count(")")
+                pad_depth += paren_delta(stripped)
                 if pad_depth <= 0:
                     # End of pad block – patch and flush
                     block = "\n".join(pad_block_lines)
@@ -301,21 +307,10 @@ class FootprintCreator:
             start = text.find("(model", idx)
             if start == -1:
                 break
-            depth = 0
-            i = start
-            end = -1
-            while i < len(text):
-                c = text[i]
-                if c == "(":
-                    depth += 1
-                elif c == ")":
-                    depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-                i += 1
-            if end == -1:
+            close = match_paren(text, start)
+            if close == -1:
                 break
+            end = close + 1
             blk = text[start:end]
             fm = re.search(r'\(model\s+"?([^")\s]+)"?', blk)
             blocks.append(
@@ -502,12 +497,26 @@ class FootprintCreator:
 
     def list_footprint_libraries(self, search_paths: Optional[List[str]] = None) -> Dict[str, Any]:
         """List all .pretty libraries and their footprints."""
+        from utils.kicad_roots import kicad_install_roots
+
+        # A later directory replaces an earlier one on a library-name clash, so
+        # the list runs oldest KiCad first and per-user libraries last: the newest
+        # install's stock libraries win over older ones, and a user's own library
+        # of the same name wins over both. The discovered install roots (registry,
+        # Program Files, custom C:\KiCad\<ver>; #286) come after the fixed
+        # Program Files locations, oldest first, for the same reason.
         default_paths = [
-            r"C:\Program Files\KiCad\9.0\share\kicad\footprints",
             r"C:\Program Files\KiCad\8.0\share\kicad\footprints",
+            r"C:\Program Files\KiCad\9.0\share\kicad\footprints",
+            r"C:\Program Files\KiCad\10.0\share\kicad\footprints",
+            *[
+                str(root / "share" / "kicad" / "footprints")
+                for root in reversed(kicad_install_roots())
+            ],
             "/usr/share/kicad/footprints",
             "/usr/local/share/kicad/footprints",
             os.path.expanduser("~/Documents/KiCad/9.0/footprints"),
+            os.path.expanduser("~/Documents/KiCad/10.0/footprints"),
         ]
         paths = search_paths or default_paths
         libraries = {}
@@ -542,7 +551,9 @@ class FootprintCreator:
             Optional description string.
         scope : str
             "project" (writes fp-lib-table next to .kicad_pro) or
-            "global"  (writes to ~/.config/kicad/9.0/fp-lib-table).
+            "global"  (adds to the newest KiCad version's existing global
+            fp-lib-table, e.g. kicad/10.0 under %APPDATA% or ~/.config;
+            fails if KiCad has not created one yet).
         project_path : str or None
             Path to the .kicad_pro file or its directory (needed for scope="project").
 
@@ -566,29 +577,23 @@ class FootprintCreator:
                 # Default: same directory as the .pretty library
                 table_dir = pretty.parent
             table_path = table_dir / "fp-lib-table"
+            # Portable like KiCad's own entries: ${KIPRJMOD}/... when inside the project.
+            uri = project_library_uri(pretty, table_dir)
         else:  # global
-            cfg_dirs = [
-                Path(os.environ.get("APPDATA", "")) / "kicad" / "9.0",
-                Path.home() / ".config" / "kicad" / "9.0",
-                Path.home() / ".local" / "share" / "kicad" / "9.0",
-            ]
-            table_path = None
-            for d in cfg_dirs:
-                candidate = d / "fp-lib-table"
-                if candidate.exists():
-                    table_path = candidate
-                    break
-            if table_path is None:
-                # Create in first writable config dir
-                for d in cfg_dirs:
-                    try:
-                        d.mkdir(parents=True, exist_ok=True)
-                        table_path = d / "fp-lib-table"
-                        break
-                    except OSError:
-                        continue
-            if table_path is None:
-                return {"success": False, "error": "Could not find or create global fp-lib-table"}
+            # The newest KiCad's own table (#425): only 9.0 used to be searched,
+            # and with none there a 9.0 table was created, which KiCad 10 never
+            # reads. See global_table_path for why a missing table is an error.
+            global_table = global_table_path("footprint")
+            if global_table is None:
+                return {
+                    "success": False,
+                    "error": no_global_table_message(
+                        "footprint",
+                        "KiCad creates it the first time it starts, so start KiCad once "
+                        "and retry, or register the library with scope='project'.",
+                    ),
+                }
+            table_path = global_table
 
         # Read existing table or start fresh
         if table_path.exists():
@@ -597,7 +602,8 @@ class FootprintCreator:
             content = "(fp_lib_table\n  (version 7)\n)\n"
 
         # Check if already registered (by name OR by uri)
-        if f'(name "{name}")' in content or uri in content:
+        absolute_uri = str(pretty).replace("\\", "/")
+        if f'(name "{name}")' in content or uri in content or absolute_uri in content:
             return {
                 "success": True,
                 "already_registered": True,
@@ -638,8 +644,13 @@ class FootprintCreator:
 
 
 def _esc(s: str) -> str:
-    """Escape double-quotes inside S-Expression string values."""
-    return s.replace('"', '\\"')
+    """Escape a value for an S-expression double-quoted token.
+
+    Delegates so there is one implementation: escaping quotes without
+    escaping backslashes first is a no-op on exactly the values that break
+    the file (#336).
+    """
+    return escape_sexpr_string(s)
 
 
 def _new_uuid() -> str:

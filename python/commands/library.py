@@ -10,12 +10,23 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from utils.kicad_roots import kicad_install_roots
 from utils.platform_helper import PlatformHelper
 
 logger = logging.getLogger("kicad_interface")
+
+
+def footprint_name_pattern(pattern: str) -> "re.Pattern[str]":
+    """Compile a footprint-name search pattern.
+
+    The pattern matches anywhere in a name, case-insensitively. ``*`` matches
+    any run of characters and every other character is literal, so ``3x14+6``
+    and ``0.5`` mean what they say and an unbalanced ``(`` is not an error.
+    """
+    parts = (re.escape(part) for part in pattern.split("*"))
+    return re.compile(".*".join(parts), re.IGNORECASE)
 
 
 class LibraryManager:
@@ -58,30 +69,22 @@ class LibraryManager:
         logger.info(f"Loaded {len(self.libraries)} footprint libraries")
 
     def _get_global_fp_lib_table(self) -> Optional[Path]:
-        """Get path to global fp-lib-table file"""
-        # Try different possible locations
-        kicad_config_paths = [
-            Path.home() / ".config" / "kicad" / "10.0" / "fp-lib-table",
-            Path.home() / ".config" / "kicad" / "9.0" / "fp-lib-table",
-            Path.home() / ".config" / "kicad" / "8.0" / "fp-lib-table",
-            Path.home() / ".config" / "kicad" / "fp-lib-table",
-            # Windows paths
-            Path.home() / "AppData" / "Roaming" / "kicad" / "10.0" / "fp-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "9.0" / "fp-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "8.0" / "fp-lib-table",
-            # macOS paths
-            Path.home() / "Library" / "Preferences" / "kicad" / "10.0" / "fp-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "fp-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "fp-lib-table",
-        ]
+        """The global fp-lib-table to read.
 
-        for path in kicad_config_paths:
-            if path.exists():
-                return path
+        Shares discovery with the table editor: it honours ``KICAD_CONFIG_HOME``,
+        ``XDG_CONFIG_HOME`` and ``APPDATA``. Before KiCad has created a user
+        table, it falls back to KiCad's stock template table.
+        """
+        from commands.library_tables import global_table_for_reading
 
-        return None
+        return global_table_for_reading("footprint")
 
-    def _parse_fp_lib_table(self, table_path: Path) -> None:
+    def _parse_fp_lib_table(
+        self,
+        table_path: Path,
+        _seen: Optional[Set[str]] = None,
+        _vars: Optional[Dict[str, Optional[str]]] = None,
+    ) -> None:
         """
         Parse fp-lib-table file
 
@@ -89,7 +92,17 @@ class LibraryManager:
         (fp_lib_table
           (lib (name "Library_Name")(type KiCad)(uri "${KICAD9_FOOTPRINT_DIR}/Library.pretty")(options "")(descr "Description"))
         )
+
+        A ``(type "Table")`` row names another table to read in its place.
+        KiCad 10's global table is one such row,
+        ``${KICAD10_TEMPLATE_DIR}/fp-lib-table``, standing for every stock
+        library, so its URI goes through the same variable resolution as a
+        library's. ``_seen`` stops a table that includes itself; ``_vars`` is
+        the path-variable map, built once for the whole load.
         """
+        seen = _seen if _seen is not None else set()
+        seen.add(os.path.realpath(table_path))
+        path_vars = _vars if _vars is not None else self._path_vars()
         try:
             with open(table_path, "r") as f:
                 content = f.read()
@@ -109,16 +122,19 @@ class LibraryManager:
                 uri = match.group(5) or match.group(6)
 
                 if lib_type.lower() == "table":
-                    table_uri = uri
-                    if os.path.isabs(table_uri) and os.path.isfile(table_uri):
-                        logger.info(f"  Following Table reference: {nickname} -> {table_uri}")
-                        self._parse_fp_lib_table(Path(table_uri))
+                    table_uri = self._resolve_uri(uri, path_vars)
+                    if table_uri and os.path.isfile(table_uri):
+                        if os.path.realpath(table_uri) in seen:
+                            logger.warning(f"  Skipping Table reference already read: {nickname}")
+                        else:
+                            logger.info(f"  Following Table reference: {nickname} -> {table_uri}")
+                            self._parse_fp_lib_table(Path(table_uri), seen, path_vars)
                     else:
-                        logger.warning(f"  Could not resolve Table URI: {table_uri}")
+                        logger.warning(f"  Could not resolve Table URI: {uri}")
                     continue
 
                 # Resolve environment variables in URI
-                resolved_uri = self._resolve_uri(uri)
+                resolved_uri = self._resolve_uri(uri, path_vars)
 
                 if resolved_uri:
                     self.libraries[nickname] = resolved_uri
@@ -129,31 +145,31 @@ class LibraryManager:
         except Exception as e:
             logger.error(f"Error parsing fp-lib-table at {table_path}: {e}")
 
-    def _resolve_uri(self, uri: str) -> Optional[str]:
-        """
-        Resolve environment variables and paths in library URI
+    def _path_vars(self) -> Dict[str, Optional[str]]:
+        """Every path variable an fp-lib-table URI can reference.
 
-        Handles:
-        - ${KICAD9_FOOTPRINT_DIR} -> /usr/share/kicad/footprints
-        - ${KICAD8_FOOTPRINT_DIR} -> /usr/share/kicad/footprints
-        - ${KIPRJMOD} -> project directory
-        - Relative paths
-        - Absolute paths
+        Computed once per table load and shared by every row: each finder
+        reads the filesystem (``load_kicad_env_vars`` and the 3rd-party finder
+        both re-read kicad_common.json), and a stock KiCad 10 table has 150+
+        rows once its ``(type "Table")`` row is followed.
         """
-        # Replace environment variables
-        resolved = uri
-
-        # Common KiCAD environment variables
-        env_vars = {
-            "KICAD10_FOOTPRINT_DIR": self._find_kicad_footprint_dir(),
-            "KICAD9_FOOTPRINT_DIR": self._find_kicad_footprint_dir(),
-            "KICAD8_FOOTPRINT_DIR": self._find_kicad_footprint_dir(),
-            "KICAD_FOOTPRINT_DIR": self._find_kicad_footprint_dir(),
-            "KISYSMOD": self._find_kicad_footprint_dir(),
-            "KICAD10_3RD_PARTY": self._find_kicad_3rdparty_dir(),
-            "KICAD9_3RD_PARTY": self._find_kicad_3rdparty_dir(),
-            "KICAD8_3RD_PARTY": self._find_kicad_3rdparty_dir(),
-            "KICAD_3RD_PARTY": self._find_kicad_3rdparty_dir(),
+        footprint_dir = self._find_kicad_footprint_dir()
+        third_party_dir = self._find_kicad_3rdparty_dir()
+        template_dir = PlatformHelper.find_kicad_template_dir()
+        env_vars: Dict[str, Optional[str]] = {
+            "KICAD10_FOOTPRINT_DIR": footprint_dir,
+            "KICAD9_FOOTPRINT_DIR": footprint_dir,
+            "KICAD8_FOOTPRINT_DIR": footprint_dir,
+            "KICAD_FOOTPRINT_DIR": footprint_dir,
+            "KISYSMOD": footprint_dir,
+            "KICAD10_3RD_PARTY": third_party_dir,
+            "KICAD9_3RD_PARTY": third_party_dir,
+            "KICAD8_3RD_PARTY": third_party_dir,
+            "KICAD_3RD_PARTY": third_party_dir,
+            "KICAD10_TEMPLATE_DIR": template_dir,
+            "KICAD9_TEMPLATE_DIR": template_dir,
+            "KICAD8_TEMPLATE_DIR": template_dir,
+            "KICAD_TEMPLATE_DIR": template_dir,
         }
 
         # Merge user-defined env vars from kicad_common.json
@@ -162,6 +178,27 @@ class LibraryManager:
         # Project directory
         if self.project_path:
             env_vars["KIPRJMOD"] = str(self.project_path)
+        return env_vars
+
+    def _resolve_uri(
+        self, uri: str, path_vars: Optional[Dict[str, Optional[str]]] = None
+    ) -> Optional[str]:
+        """
+        Resolve environment variables and paths in library URI
+
+        Handles:
+        - ${KICAD9_FOOTPRINT_DIR} -> /usr/share/kicad/footprints
+        - ${KICAD8_FOOTPRINT_DIR} -> /usr/share/kicad/footprints
+        - ${KICAD10_TEMPLATE_DIR} -> KiCad's template directory (stock tables)
+        - ${KIPRJMOD} -> project directory
+        - Relative paths
+        - Absolute paths
+
+        ``path_vars`` is the map from ``_path_vars``; table parsing passes one
+        map for every row instead of rebuilding it per URI.
+        """
+        resolved = uri
+        env_vars = path_vars if path_vars is not None else self._path_vars()
 
         # Replace environment variables
         for var, value in env_vars.items():
@@ -212,71 +249,12 @@ class LibraryManager:
         return None
 
     def _find_kicad_3rdparty_dir(self) -> Optional[str]:
+        """Find KiCAD's 3rd party (PCM) libraries directory.
+
+        Shared with the symbol side; see PlatformHelper.find_kicad_3rd_party_dir
+        for the resolution order.
         """
-        Find KiCAD 3rd party libraries directory.
-
-        Resolution order:
-        1. Shell environment variable KICAD9_3RD_PARTY
-        2. User settings in kicad_common.json
-        3. Platform-specific defaults based on detected KiCad version
-        """
-        import json
-
-        # 1. Check shell environment variable first
-        for var in ("KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY", "KICAD_3RD_PARTY"):
-            if var in os.environ:
-                path = os.environ[var]
-                if os.path.isdir(path):
-                    return path
-
-        # 2. Check kicad_common.json for user-defined variables
-        kicad_common_paths = [
-            Path.home()
-            / "Library"
-            / "Preferences"
-            / "kicad"
-            / "9.0"
-            / "kicad_common.json",  # macOS
-            Path.home() / ".config" / "kicad" / "9.0" / "kicad_common.json",  # Linux
-            Path.home() / "AppData" / "Roaming" / "kicad" / "9.0" / "kicad_common.json",  # Windows
-        ]
-
-        for config_path in kicad_common_paths:
-            if config_path.exists():
-                try:
-                    with open(config_path, "r") as f:
-                        config = json.load(f)
-                    env_vars = config.get("environment", {}).get("vars", {})
-                    if env_vars and "KICAD9_3RD_PARTY" in env_vars:
-                        path = env_vars["KICAD9_3RD_PARTY"]
-                        if os.path.isdir(path):
-                            return path
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
-
-                # Derive version from config path location
-                version = config_path.parent.name  # e.g., "9.0"
-                break
-        else:
-            version = "9.0"  # Default
-
-        # 3. Use platform-specific defaults
-        possible_paths = [
-            # macOS - Documents/KiCad/{version}/3rdparty
-            Path.home() / "Documents" / "KiCad" / version / "3rdparty",
-            # Linux - ~/.local/share/kicad/{version}/3rdparty
-            Path.home() / ".local" / "share" / "kicad" / version / "3rdparty",
-            # Windows - Documents/KiCad/{version}/3rdparty
-            Path.home() / "Documents" / "KiCad" / version / "3rdparty",
-        ]
-
-        for candidate in possible_paths:
-            if candidate.exists():
-                logger.info(f"Found KiCad 3rd party directory: {candidate}")
-                return str(candidate)
-
-        logger.warning("Could not find KiCad 3rd party directory")
-        return None
+        return PlatformHelper.find_kicad_3rd_party_dir()
 
     def list_libraries(self) -> List[str]:
         """Get list of available library nicknames"""
@@ -370,29 +348,33 @@ class LibraryManager:
             logger.warning(f"Footprint not found in any library: {footprint_name}")
             return None
 
-    def search_footprints(self, pattern: str, limit: int = 20) -> List[Dict[str, str]]:
+    def search_footprints(
+        self, pattern: str, limit: int = 20, library: Optional[str] = None
+    ) -> List[Dict[str, str]]:
         """
         Search for footprints matching a pattern
 
         Args:
-            pattern: Search pattern (supports wildcards *, case-insensitive)
+            pattern: Matched anywhere in the name, case-insensitively; ``*``
+                is a wildcard and every other character is literal
             limit: Maximum number of results to return
+            library: Only search this library nickname (case-insensitive)
 
         Returns:
             List of dicts with 'library', 'footprint', and 'full_name' keys
         """
         results = []
-        pattern_lower = pattern.lower()
+        regex = footprint_name_pattern(pattern)
 
-        # Convert wildcards to regex
-        regex_pattern = pattern_lower.replace("*", ".*")
-        regex = re.compile(regex_pattern)
+        nicknames = list(self.libraries.keys())
+        if library:
+            nicknames = [n for n in nicknames if n.lower() == library.lower()]
 
-        for library_nickname in self.libraries.keys():
+        for library_nickname in nicknames:
             footprints = self.list_footprints(library_nickname)
 
             for footprint in footprints:
-                if regex.search(footprint.lower()):
+                if regex.search(footprint):
                     results.append(
                         {
                             "library": library_nickname,
@@ -464,16 +446,10 @@ class LibraryCommands:
             limit = params.get("limit", 20)
             library_filter = params.get("library")
 
-            results = self.library_manager.search_footprints(
-                pattern, limit * 10 if library_filter else limit
-            )
-
-            # Filter by library if specified
-            if library_filter:
-                results = [
-                    r for r in results if r.get("library", "").lower() == library_filter.lower()
-                ]
-                results = results[:limit]
+            # Restrict the scan itself: filtering a capped all-library result
+            # afterwards dropped every match from libraries listed late in the
+            # table (e.g. a user library after the ~150 stock ones).
+            results = self.library_manager.search_footprints(pattern, limit, library_filter)
 
             return {
                 "success": True,
@@ -490,19 +466,41 @@ class LibraryCommands:
             }
 
     def list_library_footprints(self, params: Dict) -> Dict:
-        """List all footprints in a specific library"""
+        """List the footprints in a library, optionally filtered and capped.
+
+        ``filter`` keeps names containing it, case-insensitively, with ``*`` as
+        a wildcard; every other character is literal. ``limit`` caps the list
+        after filtering. ``count`` is the number returned and ``total`` the
+        number that matched before the cap.
+        """
         try:
             library = params.get("library") or params.get("library_name")
             if not library:
                 return {"success": False, "message": "Missing library parameter"}
 
-            footprints = self.library_manager.list_footprints(library)
+            limit = params.get("limit")
+            if limit is not None and (
+                isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+            ):
+                return {"success": False, "message": "limit must be a positive integer"}
+
+            footprints = sorted(self.library_manager.list_footprints(library), key=str.casefold)
+
+            name_filter = params.get("filter")
+            if name_filter:
+                regex = footprint_name_pattern(name_filter)
+                footprints = [name for name in footprints if regex.search(name)]
+
+            total = len(footprints)
+            if limit is not None:
+                footprints = footprints[:limit]
 
             return {
                 "success": True,
                 "library": library,
                 "footprints": footprints,
                 "count": len(footprints),
+                "total": total,
             }
         except Exception as e:
             logger.error(f"Error listing library footprints: {e}")

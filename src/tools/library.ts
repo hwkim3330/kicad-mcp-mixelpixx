@@ -36,6 +36,7 @@ export function registerLibraryTools(server: McpServer, callKicadScript: Functio
             text: `Failed to list libraries: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );
@@ -45,7 +46,9 @@ export function registerLibraryTools(server: McpServer, callKicadScript: Functio
     "search_footprints",
     "Search for footprints matching a pattern across all libraries",
     {
-      search_term: z.string().describe("Search term or pattern to match footprint names"),
+      search_term: z
+        .string()
+        .describe("Text to find in footprint names (case-insensitive, * as a wildcard)"),
       library: z.string().optional().describe("Optional specific library to search in"),
       limit: z.number().optional().default(50).describe("Maximum number of results to return"),
     },
@@ -78,6 +81,7 @@ export function registerLibraryTools(server: McpServer, callKicadScript: Functio
             text: `Failed to search footprints: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );
@@ -85,21 +89,37 @@ export function registerLibraryTools(server: McpServer, callKicadScript: Functio
   // List footprints in a specific library
   server.tool(
     "list_library_footprints",
-    "List all footprints in a specific KiCAD library",
+    "List footprints in a KiCAD library, sorted by name; returns the first 100 unless `limit` is set",
     {
       library_name: z.string().describe("Name of the library to list footprints from"),
-      filter: z.string().optional().describe("Optional filter pattern for footprint names"),
-      limit: z.number().optional().default(100).describe("Maximum number of footprints to list"),
+      filter: z
+        .string()
+        .optional()
+        .describe("Keep names containing this text (case-insensitive, * as a wildcard)"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .default(100)
+        .describe("Maximum number of footprints to list (default 100)"),
     },
     async (args: { library_name: string; filter?: string; limit?: number }) => {
       const result = await callKicadScript("list_library_footprints", args);
       if (result.success && result.footprints) {
         const footprintList = result.footprints.map((fp: string) => `  - ${fp}`).join("\n");
+        const shown = result.footprints.length;
+        const total = typeof result.total === "number" ? result.total : shown;
+        const summary =
+          total > shown
+            ? `Library ${args.library_name}: showing ${shown} of ${total} matching footprints ` +
+              "(pass `filter` to narrow, or a larger `limit` for more)"
+            : `Library ${args.library_name} contains ${shown} matching footprints`;
         return {
           content: [
             {
               type: "text",
-              text: `Library ${args.library_name} contains ${result.footprints.length} footprints:\n${footprintList}`,
+              text: `${summary}:\n${footprintList}`,
             },
           ],
         };
@@ -111,6 +131,7 @@ export function registerLibraryTools(server: McpServer, callKicadScript: Functio
             text: `Failed to list footprints in library ${args.library_name}: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
     },
   );
@@ -173,7 +194,99 @@ export function registerLibraryTools(server: McpServer, callKicadScript: Functio
             text: `Failed to get footprint info: ${result.message || "Unknown error"}`,
           },
         ],
+        isError: true,
       };
+    },
+  );
+
+  // ── Library table maintenance (sym-lib-table / fp-lib-table) ──────────── //
+
+  const tableType = z
+    .enum(["symbol", "footprint"])
+    .optional()
+    .describe("Which table to edit: 'symbol' (sym-lib-table, default) or 'footprint'");
+  const scope = z
+    .enum(["project", "global"])
+    .optional()
+    .describe("'project' (default, needs projectPath) or 'global' (KiCad's user config)");
+  const projectPath = z
+    .string()
+    .optional()
+    .describe("Path to the .kicad_pro or its directory, for scope='project'");
+  const tablePath = z
+    .string()
+    .optional()
+    .describe("Path to the table file itself, bypassing scope/projectPath resolution");
+  const dryRun = z
+    .boolean()
+    .optional()
+    .describe("Report what the edit would do without writing the table");
+
+  server.tool(
+    "list_library_table",
+    "Read a sym-lib-table or fp-lib-table: nickname, type, URI and description of every " +
+      "registered library. Each URI is resolved through ${KIPRJMOD}, KiCad's built-in library " +
+      "directories (KICAD*_SYMBOL_DIR and friends), the path variables configured in " +
+      "kicad_common.json and the environment, and reported with whether the file is actually " +
+      "there — which is how a stale row left over from a library migration shows itself. A " +
+      '(type "Table") row is flagged as an indirection, with a count of the libraries it ' +
+      "stands for.",
+    { tableType, scope, projectPath, tablePath },
+    async (args: any) => {
+      const result = await callKicadScript("list_library_table", args);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "remove_library_table_entry",
+    "Remove one or more entries from a sym-lib-table or fp-lib-table by nickname — the " +
+      "counterpart to register_symbol_library / register_footprint_library. The table is " +
+      "re-parsed before it is written, so an edit that would leave it unbalanced is refused " +
+      "rather than saved; the write is atomic and the previous contents are kept in a sibling " +
+      ".mcp-backups/ directory. Use dryRun first when the target is scope='global', which " +
+      'every project on the machine loads. Removing a (type "Table") row unregisters every ' +
+      "library in the table it points at, and the result says so.",
+    {
+      tableType,
+      scope,
+      projectPath,
+      tablePath,
+      dryRun,
+      libraryName: z.string().optional().describe("Nickname to remove"),
+      libraryNames: z
+        .array(z.string())
+        .optional()
+        .describe("Several nicknames to remove in one pass"),
+    },
+    async (args: any) => {
+      const result = await callKicadScript("remove_library_table_entry", args);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "set_library_table_uri",
+    "Repoint an existing library-table entry at a different file, keeping its nickname, type " +
+      "and description. Use it to move a project onto ${KIPRJMOD}-relative paths, or to follow " +
+      "a library that was relocated, without unregistering and re-registering it.",
+    {
+      tableType,
+      scope,
+      projectPath,
+      tablePath,
+      dryRun,
+      libraryName: z.string().describe("Nickname of the entry to repoint"),
+      uri: z
+        .string()
+        .describe(
+          "New URI, e.g. ${KIPRJMOD}/../FOG_components.kicad_sym. Path variables are kept " +
+            "verbatim in the table and only expanded when reporting whether the file exists.",
+        ),
+    },
+    async (args: any) => {
+      const result = await callKicadScript("set_library_table_uri", args);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
   );
 }

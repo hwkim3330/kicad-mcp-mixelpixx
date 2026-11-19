@@ -1,8 +1,8 @@
 # KiCAD Library Integration
 
 **Status:** ✅ COMPLETE
-**Date:** 2026-03-21
-**Version:** 2.2.3+
+**Date:** 2026-09-01
+**Version:** 2.7.0
 
 ## Overview
 
@@ -13,6 +13,8 @@ The KiCAD MCP Server includes full library integration for both footprints and s
 - ✅ Search and browse footprints/symbols across all libraries
 - ✅ Component placement using library footprints
 - ✅ Symbol creation and editing with project-local library support (v2.2.2+)
+- ✅ Library table maintenance: read, remove and repoint entries (v2.7.0)
+- ✅ Structural validation of `.kicad_sym` files before KiCad refuses them (v2.7.0)
 - ✅ Support for both `Library:Footprint` and `Footprint` formats
 
 ## How It Works
@@ -24,13 +26,15 @@ The library system automatically discovers both footprint and symbol libraries:
 **Footprint Libraries** - `LibraryManager` class:
 
 1. **Parsing fp-lib-table files:**
-   - Global: `~/.config/kicad/9.0/fp-lib-table`
+   - Global: `fp-lib-table` in the newest KiCad version's user config directory
+     (`~/.config/kicad/10.0/` on Linux, `%APPDATA%\kicad\10.0\` on Windows,
+     `~/Library/Preferences/kicad/10.0/` on macOS; then 9.0, then 8.0)
    - Project-specific: `project-dir/fp-lib-table`
 
 **Symbol Libraries** - `DynamicSymbolLoader` class (v2.2.2+):
 
 1. **Parsing sym-lib-table files:**
-   - Global: `~/.config/kicad/9.0/sym-lib-table`
+   - Global: `sym-lib-table` in the same directory as the global `fp-lib-table`
    - Project-local: `project-dir/sym-lib-table` (added v2.2.2)
 
 2. **Resolving environment variables:**
@@ -81,7 +85,9 @@ List all available footprint libraries.
 
 ### 2. `search_footprints`
 
-Search for footprints matching a pattern.
+Search for footprints matching a pattern. The pattern is matched anywhere in
+the name, case-insensitively. `*` is a wildcard and every other character is
+literal, the same as the `filter` of `list_library_footprints`.
 
 **Parameters:**
 
@@ -110,13 +116,18 @@ Search for footprints matching a pattern.
 
 ### 3. `list_library_footprints`
 
-List all footprints in a specific library.
+List the footprints in a specific library, sorted by name, ignoring case.
+`filter` (optional) keeps names containing the text, case-insensitively, with
+`*` as a wildcard. `limit` (optional, a positive integer) caps the list after
+filtering. MCP clients get at most 100 names when they pass no `limit`.
 
 **Parameters:**
 
 ```json
 {
-  "library": "Resistor_SMD"
+  "library": "Resistor_SMD",
+  "filter": "0603",
+  "limit": 1
 }
 ```
 
@@ -126,8 +137,9 @@ List all footprints in a specific library.
 {
   "success": true,
   "library": "Resistor_SMD",
-  "footprints": ["R_0402_1005Metric", "R_0603_1608Metric", ...],
-  "count": 120
+  "footprints": ["R_0603_1608Metric"],
+  "count": 1,
+  "total": 2
 }
 ```
 
@@ -156,6 +168,57 @@ Get detailed information about a specific footprint.
   }
 }
 ```
+
+### 5. Library table maintenance (v2.7.0)
+
+`register_symbol_library` and `register_footprint_library` add a row to a
+`sym-lib-table` or `fp-lib-table`. These three tools cover the rest of the life
+cycle, so cleaning up after a library move no longer means hand-editing the
+table file.
+
+All three take `scope` (`"project"` or `"global"`) or an explicit `tablePath`.
+The two mutating tools accept `dryRun` to report the edit without performing it,
+back the file up into a sibling `.mcp-backups/` directory, and re-parse the
+result before writing. A rewrite that would leave the table unbalanced is
+refused and the file is left untouched.
+
+#### `list_library_table`
+
+Read every registered library: nickname, type, URI and description.
+
+It also resolves each URI through `${KIPRJMOD}`, KiCad's built-in library
+directories, the path variables in `kicad_common.json`, and the environment,
+then reports whether the file is actually present. This is what turns "ERC
+reports hundreds of footprint link issues" into "this one row points at a
+library that moved".
+
+KiCad 10's `(type "Table")` rows are recognised as indirections rather than
+libraries: the stock global table is a single row named `KiCad` standing for
+200+ libraries, so the report says how many each row covers.
+
+#### `remove_library_table_entry`
+
+Unregister a library by nickname. Removing a `Table` row reports how many
+libraries that unregisters.
+
+#### `set_library_table_uri`
+
+Repoint a library whose files moved, without touching any other row.
+
+### 6. Symbol library maintenance (v2.7.0)
+
+- `validate_symbol_library` - report the line and column of every structural
+  fault in a `.kicad_sym`, instead of KiCad's bare "Unable to load library".
+  Run it after any tool that edits a library.
+- `set_symbol_pin_type` - set the electrical type of many pins at once, filtered
+  by symbol, pin number, pin name or current type. Symbols imported from Eagle
+  or SnapEDA often arrive with every pin `unspecified`, which buries real ERC
+  errors. `dryRun` shows the affected pins first, and the library is written
+  atomically with a timestamped backup.
+- `find_duplicate_symbols` - group symbols that are the same part stored twice
+  under different names, which is what happens when more than one source feeds a
+  library. It counts placements per symbol across the project's sheets, so the
+  report says which copy is safe to retire.
 
 ## Updated Component Placement
 
@@ -228,7 +291,7 @@ The system automatically detects KiCAD installations, but you can add custom lib
 
 ### Supported Platforms
 
-- ✅ **Linux:** `/usr/share/kicad/footprints`, `~/.config/kicad/9.0/`
+- ✅ **Linux:** `/usr/share/kicad/footprints`, `~/.config/kicad/<version>/`
 - ✅ **Windows:** `C:/Program Files/KiCAD/*/share/kicad/footprints`
 - ✅ **macOS:** `/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints`
 
@@ -341,7 +404,8 @@ rotation = module.GetOrientation().AsDegrees()
 
 1. Verify KiCAD is installed
 2. Open KiCAD and ensure libraries are configured
-3. Check `~/.config/kicad/9.0/fp-lib-table` exists
+3. Check that `fp-lib-table` exists in `~/.config/kicad/<version>/`
+   (`%APPDATA%\kicad\<version>\` on Windows)
 
 ### "Footprint not found"
 
@@ -365,12 +429,22 @@ rotation = module.GetOrientation().AsDegrees()
 
 ## Related Documentation
 
-- [ROADMAP.md](./ROADMAP.md) - Week 2 planning
-- [STATUS_SUMMARY.md](./STATUS_SUMMARY.md) - Current implementation status
-- [API.md](./API.md) - Full MCP API reference
-- [KiCAD Documentation](https://docs.kicad.org/9.0/en/pcbnew/pcbnew.html) - Official KiCAD docs
+- [TOOL_INVENTORY.md](TOOL_INVENTORY.md) - generated catalogue of every tool
+- [ROADMAP.md](ROADMAP.md) - planned work
+- [STATUS_SUMMARY.md](STATUS_SUMMARY.md) - current implementation status
+- [FOOTPRINT_SYMBOL_CREATOR_GUIDE.md](FOOTPRINT_SYMBOL_CREATOR_GUIDE.md) - creating custom parts
+- [KiCAD Documentation](https://docs.kicad.org/9.0/en/pcbnew/pcbnew.html) - official KiCAD docs
 
 ## Changelog
+
+**2026-08-20 - v2.7.0**
+
+- ✅ `list_library_table`, `remove_library_table_entry`, `set_library_table_uri`
+- ✅ `validate_symbol_library` reports the line and column of each fault
+- ✅ `set_symbol_pin_type` for bulk pin electrical-type fixes
+- ✅ `find_duplicate_symbols` for parts stored twice under different names
+- ✅ `add_symbol_property` no longer drops a closing paren on every call
+- ✅ Escaped quotes in property values survive a read/write round trip
 
 **2026-03-21 - v2.2.3+**
 

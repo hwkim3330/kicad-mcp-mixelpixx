@@ -18,6 +18,37 @@ from utils.platform_helper import PlatformHelper
 logger = logging.getLogger("kicad_interface")
 
 
+def _build_fts_match_query(query: str) -> str:
+    """Turn a free-text search into a safe FTS5 MATCH expression.
+
+    Each whitespace-delimited term becomes a quoted prefix phrase
+    (``"term"*``), so FTS5 special characters — most importantly the hyphen in
+    real MPNs like ``SHT41-AD1F-R2`` — are treated as literal text rather than
+    query operators. Without quoting, FTS5 parses ``SHT41-AD1F-R2*`` as a
+    column filter / NOT expression and raises ``no such column: AD1F``, which
+    ``search_parts`` swallowed into an empty result — so searching by a real
+    MPN silently found nothing.
+
+    Embedded double quotes are escaped by doubling. A trailing ``*`` the caller
+    already supplied is normalized so the term stays a prefix match.
+
+    Args:
+        query: Raw free-text query (e.g. ``"SHT41-AD1F-R2"`` or ``"10k 0603"``).
+
+    Returns:
+        An FTS5 MATCH string, e.g. ``'"sht41-ad1f-r2"*'`` or ``'"10k"* "0603"*'``.
+    """
+    terms = []
+    for term in query.strip().split():
+        if term.endswith("*"):
+            term = term[:-1]
+        if not term:
+            continue
+        escaped = term.replace('"', '""')
+        terms.append(f'"{escaped}"*')
+    return " ".join(terms)
+
+
 class JLCPCBPartsManager:
     """
     Manages local database of JLCPCB parts
@@ -34,14 +65,34 @@ class JLCPCBPartsManager:
                 user data directory, e.g. ~/.local/share/kicad-mcp/jlcpcb_parts.db
                 on Linux). See PlatformHelper.get_data_dir() for platform paths.
         """
+        self.conn: Optional[sqlite3.Connection] = None
+        self.db_path = db_path or ""
+
         if db_path is None:
             data_dir = PlatformHelper.get_data_dir()
-            data_dir.mkdir(parents=True, exist_ok=True)
-            db_path = str(data_dir / "jlcpcb_parts.db")
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+            except (PermissionError, OSError) as exc:
+                logger.warning(
+                    "Cannot create JLCPCB data directory %s: %s. "
+                    "JLCPCB parts database will be disabled.",
+                    data_dir,
+                    exc,
+                )
+                return  # self.conn stays None — disabled
 
-        self.db_path = db_path
-        self.conn: Optional[sqlite3.Connection] = None
-        self._init_database()
+            db_path = str(data_dir / "jlcpcb_parts.db")
+            self.db_path = db_path
+
+        try:
+            self._init_database()
+        except sqlite3.OperationalError as exc:
+            logger.warning(
+                "Cannot open JLCPCB parts database at %s: %s. "
+                "JLCPCB parts database will be disabled.",
+                self.db_path,
+                exc,
+            )
 
     def _init_database(self) -> None:
         """Initialize SQLite database with schema"""
@@ -102,6 +153,9 @@ class JLCPCBPartsManager:
             parts: List of part dicts from JLCPCB API
             progress_callback: Optional callback(current, total, message)
         """
+        if self.conn is None:
+            logger.warning("JLCPCB database not available — skipping import_parts")
+            return
         cursor = self.conn.cursor()
         imported = 0
         skipped = 0
@@ -181,6 +235,9 @@ class JLCPCBPartsManager:
             parts: List of part dicts from JLCSearch API
             progress_callback: Optional callback(current, total, message)
         """
+        if self.conn is None:
+            logger.warning("JLCPCB database not available — skipping import_jlcsearch_parts")
+            return
         cursor = self.conn.cursor()
         imported = 0
         skipped = 0
@@ -286,6 +343,9 @@ class JLCPCBPartsManager:
         Returns:
             List of matching parts
         """
+        if self.conn is None:
+            logger.warning("JLCPCB database not available — skipping search_parts")
+            return []
         cursor = self.conn.cursor()
 
         # Build query
@@ -293,19 +353,19 @@ class JLCPCBPartsManager:
         params = []
 
         if query:
-            # Use FTS for text search
-            # Add prefix wildcard to each term for partial matching
-            # (e.g., "BQ25895" becomes "BQ25895*" so FTS matches "BQ25895RTWR")
-            fts_query = " ".join(
-                f"{term}*" if not term.endswith("*") else term for term in query.strip().split()
-            )
-            sql_parts.append("""
-                AND lcsc IN (
-                    SELECT lcsc FROM components_fts
-                    WHERE components_fts MATCH ?
-                )
-            """)
-            params.append(fts_query)
+            # Use FTS for text search. Each term becomes a quoted prefix phrase
+            # (e.g. "BQ25895" -> '"BQ25895"*' so FTS matches "BQ25895RTWR"), which
+            # also makes hyphenated MPNs like "SHT41-AD1F-R2" literal text instead
+            # of FTS operators. See _build_fts_match_query.
+            fts_query = _build_fts_match_query(query)
+            if fts_query:
+                sql_parts.append("""
+                    AND lcsc IN (
+                        SELECT lcsc FROM components_fts
+                        WHERE components_fts MATCH ?
+                    )
+                """)
+                params.append(fts_query)
 
         if category:
             sql_parts.append("AND category LIKE ?")
@@ -349,6 +409,8 @@ class JLCPCBPartsManager:
         Returns:
             Part info dict or None if not found
         """
+        if self.conn is None:
+            return None
         cursor = self.conn.cursor()
         cursor.execute("SELECT * FROM components WHERE lcsc = ?", (lcsc_number,))
         row = cursor.fetchone()
@@ -366,6 +428,14 @@ class JLCPCBPartsManager:
 
     def get_database_stats(self) -> Dict:
         """Get statistics about the database"""
+        if self.conn is None:
+            return {
+                "total_parts": 0,
+                "basic_parts": 0,
+                "extended_parts": 0,
+                "in_stock": 0,
+                "db_path": self.db_path,
+            }
         cursor = self.conn.cursor()
 
         cursor.execute("SELECT COUNT(*) as total FROM components")
@@ -477,6 +547,7 @@ class JLCPCBPartsManager:
         """Close database connection"""
         if self.conn:
             self.conn.close()
+            self.conn = None
 
 
 if __name__ == "__main__":

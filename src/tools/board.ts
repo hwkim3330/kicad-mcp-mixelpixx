@@ -7,6 +7,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { logger } from "../logger.js";
+import { addZoneToCopperPour } from "./tool-aliases.js";
 
 // Command function type for KiCAD script calls
 type CommandFunction = (command: string, params: Record<string, unknown>) => Promise<any>;
@@ -39,6 +40,58 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
         unit,
       });
 
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result),
+          },
+        ],
+      };
+    },
+  );
+
+  // ------------------------------------------------------
+  // Board Origin Tools (aux / grid origin)
+  // ------------------------------------------------------
+  server.tool(
+    "set_board_origin",
+    "Set the auxiliary (drill/place) origin and/or grid origin of a .kicad_pcb. " +
+      "The aux origin is the datum used by export_drill's drillOrigin:'plot' option and " +
+      "by pick-and-place / plot exports with useAuxOrigin. File-based (LoadBoard -> " +
+      "SaveBoard): if the board is open in the KiCad GUI, a later GUI save will overwrite " +
+      "this edit.",
+    {
+      boardPath: z.string().describe("Path to the .kicad_pcb file"),
+      type: z
+        .enum(["aux", "grid", "both"])
+        .optional()
+        .describe("Which origin to set (default: aux)"),
+      x: z.number().describe("Origin X coordinate"),
+      y: z.number().describe("Origin Y coordinate"),
+      unit: z.enum(["mm", "mil", "inch"]).optional().describe("Coordinate unit (default: mm)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("set_board_origin", args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "get_board_origin",
+    "Read back the auxiliary (drill/place) origin and grid origin of a .kicad_pcb in mm.",
+    {
+      boardPath: z.string().describe("Path to the .kicad_pcb file"),
+    },
+    async (args) => {
+      const result = await callKicadScript("get_board_origin", args);
       return {
         content: [
           {
@@ -150,6 +203,107 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
     },
   );
 
+  server.tool(
+    "get_stackup",
+    "Read the stackup from the saved board file, not the board open in memory. Returns each copper, dielectric, mask, and silk entry with its thickness in millimetres. A thickness the stackup editor has locked is returned as thicknessMm plus thicknessLocked. Layer names are the names stored on the board, so a renamed layer such as 'Top Side' is returned beside the canonical F.Cu name. If an earlier save was refused, the file can be older than the session. Pass expected to compare those rows with a recipe in the same call; thicknessToleranceMm defaults to 0.001 mm and epsilonTolerance defaults to 0.01.",
+    {
+      expected: z
+        .array(
+          z.object({
+            index: z.number().int().nonnegative().optional().describe("Row index from get_stackup"),
+            layer: z
+              .string()
+              .optional()
+              .describe("Canonical name such as F.Cu, or the name stored on the board"),
+            type: z
+              .enum([
+                "copper",
+                "dielectric",
+                "soldermask",
+                "solderpaste",
+                "silkscreen",
+                "undefined",
+              ])
+              .optional()
+              .describe("Expected row type"),
+            thicknessMm: z.number().optional().describe("Expected thickness in millimetres"),
+            epsilonR: z.number().optional().describe("Expected relative permittivity"),
+          }),
+        )
+        .min(1)
+        .optional()
+        .describe("Rows to compare. Each row needs index or layer. Omit to only read the stackup"),
+      thicknessToleranceMm: z
+        .number()
+        .nonnegative()
+        .optional()
+        .describe("Allowed thickness difference in millimetres. Default 0.001"),
+      epsilonTolerance: z
+        .number()
+        .nonnegative()
+        .optional()
+        .describe("Allowed relative-permittivity difference. Default 0.01"),
+    },
+    async (args) => {
+      logger.debug("Reading board stackup");
+      const result = await callKicadScript("get_stackup", args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "set_stackup_layer",
+    "Set the thickness of one stackup row in the board file, and for a dielectric its material, relative permittivity, and loss tangent. Identify the row by index from get_stackup or by a layer name such as F.Cu or the name stored on the board. Only the fields you pass are changed. sublayer selects a dielectric piece and defaults to 0.",
+    {
+      index: z.number().int().nonnegative().optional().describe("Row index from get_stackup"),
+      layer: z
+        .string()
+        .optional()
+        .describe("Canonical name such as F.Cu, or the name stored on the board"),
+      sublayer: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Dielectric sublayer. Defaults to 0"),
+      thicknessMm: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Thickness of this sublayer in millimetres"),
+      epsilonR: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Relative permittivity. Dielectric rows only"),
+      lossTangent: z
+        .number()
+        .nonnegative()
+        .optional()
+        .describe("Loss tangent. Dielectric rows only"),
+      material: z.string().optional().describe("Material name. Dielectric rows only"),
+    },
+    async (args) => {
+      logger.debug("Writing one stackup row");
+      const result = await callKicadScript("set_stackup_layer", args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
   // ------------------------------------------------------
   // Add Board Outline Tool
   // ------------------------------------------------------
@@ -202,6 +356,86 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
           },
         ],
       };
+    },
+  );
+
+  server.tool(
+    "clear_board_outline",
+    "Delete all Edge.Cuts graphics from the current PCB board.",
+    {},
+    async () => {
+      logger.debug("Clearing board outline");
+      const result = await callKicadScript("clear_board_outline", {});
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    },
+  );
+
+  server.tool(
+    "replace_board_outline",
+    "Replace the current Edge.Cuts board outline with a rectangle, rounded rectangle, circle or polygon.",
+    {
+      shape: z.enum(["rectangle", "circle", "polygon", "rounded_rectangle"]),
+      params: z.object({
+        width: z.number().optional(),
+        height: z.number().optional(),
+        cornerRadius: z.number().optional(),
+        radius: z.number().optional(),
+        points: z.array(z.object({ x: z.number(), y: z.number() })).optional(),
+        x: z.number().optional(),
+        y: z.number().optional(),
+        centerX: z.number().optional(),
+        centerY: z.number().optional(),
+        unit: z.enum(["mm", "mil", "inch"]).optional(),
+      }),
+    },
+    async ({ shape, params }) => {
+      logger.debug(`Replacing board outline with ${shape}`);
+      const result = await callKicadScript("replace_board_outline", { shape, ...params });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    },
+  );
+
+  server.tool(
+    "list_graphics",
+    "List PCB graphic/drawing items such as gr_line, gr_arc, gr_rect, gr_text and dimensions.",
+    {
+      layer: z.string().optional().describe("Optional layer filter, e.g. Edge.Cuts or F.SilkS"),
+    },
+    async ({ layer }) => {
+      const result = await callKicadScript("list_graphics", { layer });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    },
+  );
+
+  server.tool(
+    "delete_graphic",
+    "Delete a PCB graphic/drawing item by UUID.",
+    {
+      uuid: z.string().describe("KiCad UUID of the graphic item"),
+    },
+    async ({ uuid }) => {
+      const result = await callKicadScript("delete_graphic", { uuid });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    },
+  );
+
+  server.tool(
+    "update_graphic",
+    "Update common properties of a PCB graphic/drawing item by UUID.",
+    {
+      uuid: z.string(),
+      layer: z.string().optional(),
+      width: z.number().optional(),
+      unit: z.enum(["mm", "mil", "inch"]).optional(),
+      start: z.object({ x: z.number(), y: z.number() }).optional(),
+      end: z.object({ x: z.number(), y: z.number() }).optional(),
+      center: z.object({ x: z.number(), y: z.number() }).optional(),
+      position: z.object({ x: z.number(), y: z.number() }).optional(),
+      text: z.string().optional(),
+    },
+    async (args) => {
+      const result = await callKicadScript("update_graphic", args);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
     },
   );
 
@@ -312,15 +546,20 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
     },
     async ({ layer, net, points, unit, clearance, minWidth, padConnection }) => {
       logger.debug(`Adding zone on layer ${layer} for net ${net}`);
-      const result = await callKicadScript("add_zone", {
-        layer,
-        net,
-        points,
-        unit,
-        clearance,
-        minWidth,
-        padConnection,
-      });
+      // The Python side has no add_zone command: a zone is a copper pour, so
+      // run add_copper_pour, which also brings its IPC path and auto-save.
+      const result = await callKicadScript(
+        "add_copper_pour",
+        addZoneToCopperPour({
+          layer,
+          net,
+          points,
+          unit,
+          clearance,
+          minWidth,
+          padConnection,
+        }),
+      );
 
       return {
         content: [
@@ -330,6 +569,36 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
           },
         ],
       };
+    },
+  );
+
+  // ------------------------------------------------------
+  // Copper-fill keepout tool
+  // ------------------------------------------------------
+  server.tool(
+    "add_copper_keepout",
+    "Add a live KiCad rule area that excludes copper zone fill on the selected enabled copper layers. " +
+      "Tracks, vias, pads and footprints remain allowed. Requires an open PCB editor; save the board separately.",
+    {
+      boardPath: z.string().min(1).describe("Exact .kicad_pcb path open in the PCB editor"),
+      name: z.string().min(1).describe("Name shown for the rule area"),
+      layers: z
+        .array(z.string())
+        .min(1)
+        .describe("Exact enabled copper layers, for example F.Cu, In1.Cu, B.Cu"),
+      points: z
+        .array(z.object({ x: z.number().finite(), y: z.number().finite() }))
+        .min(3)
+        .describe("Simple polygon vertices in millimetres, without a repeated closing vertex"),
+    },
+    async ({ boardPath, name, layers, points }) => {
+      const result = await callKicadScript("add_copper_keepout", {
+        boardPath,
+        name,
+        layers,
+        points,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
     },
   );
 
@@ -364,15 +633,23 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
     "get_board_2d_view",
     [
       "Render a 2D image of the PCB using kicad-cli. Returns PNG, JPG, or SVG.",
-      "Use layers to filter — e.g. [\"F.Cu\",\"B.Cu\",\"Edge.Cuts\"] for copper + outline only.",
+      'Use layers to filter — e.g. ["F.Cu","B.Cu","Edge.Cuts"] for copper + outline only.',
       "Use responseMode to choose delivery:",
       '  "inline" (default) — PNG/JPG rendered as an image visible to Claude; SVG returned as text.',
       '  "file" — image written next to the .kicad_pcb as <board>_2d_view.<ext>; filePath is returned.',
       "Use file mode for large boards to avoid MCP message-size limits.",
     ].join(" "),
     {
-      pcbPath: z.string().optional().describe("Absolute path to the .kicad_pcb file. Falls back to the currently loaded board if omitted."),
-      layers: z.array(z.string()).optional().describe("Layer names to include, e.g. [\"F.Cu\",\"B.Cu\",\"Edge.Cuts\"]. Omit for all layers."),
+      pcbPath: z
+        .string()
+        .optional()
+        .describe(
+          "Absolute path to the .kicad_pcb file. Falls back to the currently loaded board if omitted.",
+        ),
+      layers: z
+        .array(z.string())
+        .optional()
+        .describe('Layer names to include, e.g. ["F.Cu","B.Cu","Edge.Cuts"]. Omit for all layers.'),
       width: z.number().optional().describe("Output image width in pixels (default: 1600)"),
       height: z.number().optional().describe("Output image height in pixels (default: 1200)"),
       format: z.enum(["png", "jpg", "svg"]).optional().describe("Output format (default: png)"),
@@ -405,7 +682,10 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
         if (result.format === "svg") {
           const parts: { type: "text"; text: string }[] = [];
           if (result.message) parts.push({ type: "text" as const, text: result.message });
-          parts.push({ type: "text" as const, text: Buffer.from(result.imageData, "base64").toString("utf-8") });
+          parts.push({
+            type: "text" as const,
+            text: Buffer.from(result.imageData, "base64").toString("utf-8"),
+          });
           return { content: parts };
         }
         // inline png/jpg — return as renderable image

@@ -3,7 +3,11 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from skip import Schematic
+try:
+    from skip import Schematic
+except ImportError:
+    # kicad-skip is optional; fall back to Any so these type hints stay valid.
+    Schematic = Any
 
 logger = logging.getLogger(__name__)
 
@@ -420,7 +424,7 @@ class ConnectionManager:
             }
         """
         try:
-            from commands.wire_connectivity import get_connections_for_net
+            from commands.wire_connectivity import get_connections_for_nets
 
             netlist: Dict[str, Any] = {"nets": [], "components": []}
 
@@ -449,8 +453,12 @@ class ConnectionManager:
                             net_names.add(label.value)
 
             sch_path_str = str(schematic_path) if schematic_path else ""
-            for net_name in net_names:
-                connections = get_connections_for_net(schematic, sch_path_str, net_name)
+            # Batched: every sheet is parsed and pin-located once for the whole
+            # net list, instead of once per net.
+            connections_by_net = get_connections_for_nets(
+                schematic, sch_path_str, sorted(net_names)
+            )
+            for net_name, connections in connections_by_net.items():
                 if connections:
                     netlist["nets"].append({"name": net_name, "connections": connections})
 

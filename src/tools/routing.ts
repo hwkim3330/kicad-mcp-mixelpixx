@@ -119,7 +119,10 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
         })
         .describe("Via position"),
       net: z.string().describe("Net name"),
-      viaType: z.string().optional().describe("Via type (through, blind, buried)"),
+      viaType: z
+        .string()
+        .optional()
+        .describe('Via type. Only "through" (the default) is supported; other types are refused'),
     },
     async (args: any) => {
       const result = await callKicadScript("add_via", args);
@@ -147,6 +150,24 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
         .optional()
         .describe(
           "Array of {x, y} points defining the pour boundary. If omitted, the board outline is used.",
+        ),
+      minWidth: z.number().optional().describe("Minimum fill width in mm (default 0.2)"),
+      priority: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe(
+          "Zone priority (default 0). Overlapping zones on one layer need distinct priorities; " +
+            "the higher one fills first.",
+        ),
+      fillType: z.enum(["solid", "hatched"]).optional().describe("Fill style (default solid)"),
+      padConnection: z
+        .enum(["thermal", "solid", "none"])
+        .optional()
+        .describe(
+          "How pads of the zone's net connect: thermal reliefs (default), solid copper " +
+            "(for high-current pads), or not at all",
         ),
     },
     async (args: any) => {
@@ -225,6 +246,64 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
     },
   );
 
+  server.tool(
+    "summarize_vias",
+    "Count vias on the board without listing them. Returns the via count, how many run from F.Cu to B.Cu, a drill histogram, and the layer spans. Filter by net, rectangle, drill, or layer name. A stitched ground net can hold thousands of vias; this summary is the census a PDN review needs.",
+    {
+      net: z.string().optional().describe("Only vias on this net, for example GND"),
+      boundingBox: z
+        .object({
+          x1: z.number(),
+          y1: z.number(),
+          x2: z.number(),
+          y2: z.number(),
+          unit: z.enum(["mm", "mil", "inch"]).optional(),
+        })
+        .optional()
+        .describe("Rectangle. Only vias whose centre lies inside are counted."),
+      drillMin: z.number().optional().describe("Minimum drill diameter in millimetres, inclusive"),
+      drillMax: z.number().optional().describe("Maximum drill diameter in millimetres, inclusive"),
+      startLayer: z
+        .string()
+        .optional()
+        .describe("Match the via start layer by the board's name or the canonical name"),
+      endLayer: z
+        .string()
+        .optional()
+        .describe("Match the via end layer by the board's name or the canonical name"),
+    },
+    async (args) => {
+      const result = await callKicadScript("summarize_vias", args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "summarize_net_copper",
+    "Summarize one net's copper without listing every track, via, and zone. Returns the three counts, the layers involved, the bounding box, and a shape: vias_only, tracks_only, zones_only, empty, or mixed. vias_only means the net has vias and neither tracks nor zones. An unknown net is an error, not an empty shape.",
+    {
+      net: z.string().describe("Net name, for example GND or NetL2_1"),
+    },
+    async (args) => {
+      const result = await callKicadScript("summarize_net_copper", args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
   // Query zones tool
   server.tool(
     "query_zones",
@@ -281,9 +360,7 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
       gndNet: z
         .string()
         .optional()
-        .describe(
-          "Name of the ground net (default: auto-detect GND / GROUND / VSS / /GND).",
-        ),
+        .describe("Name of the ground net (default: auto-detect GND / GROUND / VSS / /GND)."),
       strategies: z
         .array(z.enum(["grid", "around_refs", "in_zones"]))
         .optional()
@@ -304,9 +381,7 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
       spacing: z
         .number()
         .optional()
-        .describe(
-          "Grid spacing in mm for `grid` and `around_refs` strategies (default 5.0).",
-        ),
+        .describe("Grid spacing in mm for `grid` and `around_refs` strategies (default 5.0)."),
       densifyRefs: z
         .array(z.string())
         .optional()
@@ -357,8 +432,11 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
       includeStats: z
         .boolean()
         .optional()
-        .describe("Include statistics (track count, total length, etc.)"),
-      unit: z.enum(["mm", "mil", "inch"]).optional().describe("Unit for length measurements"),
+        .describe("Add per-net stats: track count, total track length and via count"),
+      unit: z
+        .enum(["mm", "mil", "inch"])
+        .optional()
+        .describe("Unit for track lengths (default: mm)"),
     },
     async (args: any) => {
       const result = await callKicadScript("get_nets_list", args);
@@ -399,13 +477,21 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
   // Create netclass tool
   server.tool(
     "create_netclass",
-    "Create a new net class with custom design rules.",
+    "Create a new net class with custom design rules, optionally assigning nets to it immediately.",
     {
       name: z.string().describe("Net class name"),
       traceWidth: z.number().optional().describe("Default trace width in mm"),
       clearance: z.number().optional().describe("Clearance in mm"),
       viaDiameter: z.number().optional().describe("Via diameter in mm"),
       viaDrill: z.number().optional().describe("Via drill size in mm"),
+      uviaDiameter: z.number().optional().describe("Micro via diameter in mm"),
+      uviaDrill: z.number().optional().describe("Micro via drill size in mm"),
+      diffPairWidth: z.number().optional().describe("Differential pair trace width in mm"),
+      diffPairGap: z.number().optional().describe("Differential pair gap in mm"),
+      nets: z
+        .array(z.string())
+        .optional()
+        .describe("Net names to assign to this class immediately"),
     },
     async (args: any) => {
       const result = await callKicadScript("create_netclass", args);
@@ -420,26 +506,57 @@ export function registerRoutingTools(server: McpServer, callKicadScript: Functio
     },
   );
 
+  // Set net color tool
+  server.tool(
+    "set_net_color",
+    "Set or clear a net's display color override (the PCB editor's 'Net colors' panel). " +
+      "Persisted to the project's net_settings.net_colors; does not affect routing or design rules.",
+    {
+      net: z.string().describe("Name of the net"),
+      color: z
+        .string()
+        .optional()
+        .describe("Hex color, e.g. '#FF7D00'. Required unless clear is true."),
+      clear: z
+        .boolean()
+        .optional()
+        .describe("If true, remove the color override and revert to the automatic/class color"),
+    },
+    async (args: any) => {
+      const result = await callKicadScript("set_net_color", args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
   // Route differential pair tool
   server.tool(
     "route_differential_pair",
-    "Route a differential pair between two sets of points.",
+    "Route a differential pair as two parallel straight segments. startPos and endPos are the pair's centreline; looking from start to end on the board (y down), the positive trace runs on the right and the negative on the left, each offset by (gap + width) / 2.",
     {
-      positivePad: z
+      startPos: z
         .object({
-          reference: z.string(),
-          pad: z.string(),
+          x: z.number(),
+          y: z.number(),
+          unit: z.enum(["mm", "mil", "inch"]).optional(),
         })
-        .describe("Positive pad (component and pad number)"),
-      negativePad: z
+        .describe("Start of the pair's centreline"),
+      endPos: z
         .object({
-          reference: z.string(),
-          pad: z.string(),
+          x: z.number(),
+          y: z.number(),
+          unit: z.enum(["mm", "mil", "inch"]).optional(),
         })
-        .describe("Negative pad (component and pad number)"),
+        .describe("End of the pair's centreline"),
       layer: z.string().describe("PCB layer"),
       width: z.number().describe("Trace width in mm"),
-      gap: z.number().describe("Gap between traces in mm"),
+      gap: z.number().describe("Edge-to-edge gap between the two traces in mm"),
       positiveNet: z.string().describe("Positive net name"),
       negativeNet: z.string().describe("Negative net name"),
     },

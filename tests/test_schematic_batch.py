@@ -52,6 +52,32 @@ class TestHelpers:
         # Too far -> None
         assert _find_facing_label(f, "VBUS", [100, 200], orientation=180) is None
 
+    def test_facing_label_must_be_on_the_pins_axis(self, tmp_path):
+        # The HV PWR case: C39's pin at (351.79, 96.52) points left (180); a "U10 BST"
+        # label at angle 0 sits 9 mm left and 10 mm down. Joining them drew a diagonal.
+        f = tmp_path / "s.kicad_sch"
+        f.write_text('(kicad_sch (label "U10 BST" (at 342.9 106.68 0)))')
+        assert _find_facing_label(f, "U10 BST", [351.79, 96.52], orientation=180) is None
+        # Same label straight out to the left of the pin, on its row: a wire is right.
+        assert _find_facing_label(f, "U10 BST", [351.79, 106.68], orientation=180) == [
+            342.9,
+            106.68,
+        ]
+
+    def test_facing_label_behind_the_pin_is_not_facing(self, tmp_path):
+        # A pin pointing left (180) with the label to its right would wire back
+        # across its own symbol body.
+        f = tmp_path / "s.kicad_sch"
+        f.write_text('(kicad_sch (label "VBUS" (at 20 20 0)))')
+        assert _find_facing_label(f, "VBUS", [12, 20], orientation=180) is None
+
+    def test_facing_label_vertical_pins(self, tmp_path):
+        # Pin pointing up (90; outward is -y on the sheet) with a label above it at 270.
+        f = tmp_path / "s.kicad_sch"
+        f.write_text('(kicad_sch (label "SDA" (at 30 10 270)))')
+        assert _find_facing_label(f, "SDA", [30, 20], orientation=90) == [30.0, 10.0]
+        assert _find_facing_label(f, "SDA", [30, 0], orientation=90) is None
+
     def test_field_positions_two_pin_vertical(self):
         # pins stacked vertically -> labels go left/right
         pins = {"1": [0, 5], "2": [0, -5]}
@@ -160,8 +186,8 @@ class TestBatchConnect:
         )
         labels = []
         fake_wm = types.SimpleNamespace(
-            add_label=lambda p, net, pos, label_type="label", orientation=0: labels.append(
-                (net, orientation)
+            add_labels_and_wires=lambda p, new_labels, wires, **k: labels.extend(
+                (net, orientation) for net, _pos, _kind, orientation in new_labels
             )
             or True,
             add_wire=lambda *a: True,
@@ -175,7 +201,116 @@ class TestBatchConnect:
         r = c.batch_connect({"schematicPath": str(f), "connections": {"R1": {"1": "SDA"}}})
         assert r["success"] is True
         assert len(r["placed"]) == 1
-        assert labels == [("SDA", 180)]  # pin angle 0 -> label orientation 180
+        # A pin whose outward direction is 0 (pointing right) gets a label at 0:
+        # KiCad renders angle 0 with `justify left`, i.e. text growing rightwards,
+        # away from the symbol body. The label follows the pin, never turns back
+        # over it.
+        assert labels == [("SDA", 0)]
+
+    def test_places_global_label(self, monkeypatch, tmp_path):
+        f = tmp_path / "x.kicad_sch"
+        f.write_text("(kicad_sch)")
+        fake_loc = types.SimpleNamespace(
+            get_pin_location=lambda p, ref, pin: [10.0, 20.0],
+            get_pin_angle=lambda p, ref, pin: 0,
+            get_all_symbol_pins=lambda p, ref: {"1": [10.0, 20.0]},
+        )
+        kinds = []
+        fake_wm = types.SimpleNamespace(
+            add_labels_and_wires=lambda p, new_labels, wires, **k: kinds.extend(
+                kind for _net, _pos, kind, _angle in new_labels
+            )
+            or True,
+            add_wire=lambda *a: True,
+            delete_label=lambda *a, **k: True,
+        )
+
+        # _find_facing_label must NOT be consulted for global labels; make it raise if called.
+        def _boom(*a, **k):
+            raise AssertionError("facing-label lookup should be skipped for global labels")
+
+        monkeypatch.setattr(sb, "PinLocator", lambda: fake_loc)
+        monkeypatch.setattr(sb, "WireManager", fake_wm)
+        monkeypatch.setattr(sb, "_find_facing_label", _boom)
+
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect(
+            {
+                "schematicPath": str(f),
+                "connections": {"U1": {"9": "GND"}},
+                "labelType": "global_label",
+            }
+        )
+        assert r["success"] is True
+        assert kinds == ["global_label"]
+
+    def test_rejects_invalid_label_type(self, tmp_path):
+        f = tmp_path / "x.kicad_sch"
+        f.write_text("(kicad_sch)")
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_connect(
+            {"schematicPath": str(f), "connections": {"R1": {"1": "X"}}, "labelType": "bogus"}
+        )
+        assert r["success"] is False
+        assert "labelType" in r["message"]
+
+
+class TestBatchAddUnits:
+    """A multi-unit part is placed one entry per unit, all sharing a reference.
+
+    Regression: batch_add_components ignored `unit` and always placed unit 1, so
+    a five-unit FPGA needed five separate add_schematic_component calls — the
+    round-trips the batch exists to avoid.
+    """
+
+    def _stub_loader(self, monkeypatch, tmp_path, calls):
+        sch = tmp_path / "x.kicad_sch"
+        sch.write_text("(kicad_sch)")
+
+        def fake_add_component(self, path, library, name, **kwargs):
+            calls.append((name, kwargs.get("unit"), kwargs.get("reference")))
+            return True
+
+        monkeypatch.setattr(sb.DynamicSymbolLoader, "add_component", fake_add_component)
+        monkeypatch.setattr(
+            sb,
+            "PinLocator",
+            lambda: types.SimpleNamespace(
+                _schematic_cache={},
+                get_all_symbol_pins=lambda p, ref: {},
+            ),
+        )
+        monkeypatch.setattr(sb, "_find_placed_symbol_block", lambda *a, **k: (None, -1, -1))
+        return sch
+
+    def test_unit_is_passed_through(self, monkeypatch, tmp_path):
+        calls = []
+        sch = self._stub_loader(monkeypatch, tmp_path, calls)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        r = c.batch_add_components(
+            {
+                "schematicPath": str(sch),
+                "components": [
+                    {"symbol": "FPGA:GW2A", "reference": "U201", "unit": 1},
+                    {"symbol": "FPGA:GW2A", "reference": "U201", "unit": 4},
+                ],
+            }
+        )
+        assert r["added_count"] == 2
+        assert calls == [("GW2A", 1, "U201"), ("GW2A", 4, "U201")]
+        assert [e["unit"] for e in r["added"]] == [1, 4]
+
+    def test_unit_defaults_to_one(self, monkeypatch, tmp_path):
+        calls = []
+        sch = self._stub_loader(monkeypatch, tmp_path, calls)
+        c = SchematicBatchCommands(types.SimpleNamespace())
+        c.batch_add_components(
+            {
+                "schematicPath": str(sch),
+                "components": [{"symbol": "Device:R", "reference": "R1"}],
+            }
+        )
+        assert calls == [("R", 1, "R1")]
 
 
 class TestBatchAddAndConnect:
@@ -204,6 +339,7 @@ class TestBatchAddAndConnect:
             {
                 "schematicPath": "/x.kicad_sch",
                 "components": [{"symbol": "Device:R", "reference": "R1", "nets": {"1": "VCC"}}],
+                "labelType": "global_label",
             }
         )
         assert r["success"] is True
@@ -213,3 +349,108 @@ class TestBatchAddAndConnect:
         assert "nets" not in add_args["components"][0]
         # nets routed to batch_connect keyed by reference
         assert conn_args["connections"] == {"R1": {"1": "VCC"}}
+        # labelType threaded through to batch_connect
+        assert conn_args["labelType"] == "global_label"
+
+
+class TestReplaceFieldRestore:
+    """Regression: field restore after replace must be block-scoped.
+
+    The old implementation regex-substituted the first matching
+    (property "<name>" ...) in the WHOLE file, which for names like
+    "Description" lives inside lib_symbols — corrupting an unrelated
+    library symbol definition.
+    """
+
+    _SCH = """\
+(kicad_sch (version 20250114) (generator "test")
+  (uuid aaaaaaaa-0000-0000-0000-000000000020)
+  (paper "A4")
+  (lib_symbols
+    (symbol "Connector_Generic:Conn_01x04"
+      (property "Description" "LIBRARY TEXT"
+        (at 0 0 0)
+      )
+    )
+  )
+  (symbol (lib_id "Device:D_TVS") (at 44.45 57.15 0)
+    (uuid dddddddd-0000-0000-0000-000000000021)
+    (property "Reference" "D1" (at 0 0 0))
+    (property "Value" "SMBJ15A" (at 0 0 0))
+    (property "Description" "OLD DESC" (at 0 0 0))
+  )
+  (sheet_instances (path "/" (page "1")))
+)
+"""
+
+    _NEW_BLOCK = """  (symbol (lib_id "Device:D_Zener") (at 44.45 57.15 0)
+    (uuid dddddddd-0000-0000-0000-000000000022)
+    (property "Reference" "D1" (at 0 0 0))
+    (property "Value" "SMBJ15A" (at 0 0 0))
+    (property "Description" "" (at 0 0 0))
+  )
+"""
+
+    def test_restore_delegates_to_block_scoped_editor(self, tmp_path, monkeypatch):
+        sch = tmp_path / "board.kicad_sch"
+        sch.write_text(self._SCH, encoding="utf-8")
+
+        def fake_get_component(params):
+            return {
+                "success": True,
+                "position": {"x": 44.45, "y": 57.15, "angle": 0},
+                "fields": {
+                    "Reference": {"value": "D1"},
+                    "Value": {"value": "SMBJ15A"},
+                    "Footprint": {"value": "Diode_SMD:D_SMB"},
+                    "Description": {"value": "OLD DESC"},
+                },
+            }
+
+        edit_calls = []
+
+        def fake_edit(params):
+            edit_calls.append(params)
+            return {"success": True}
+
+        def fake_add_component(self_loader, sch_file, *a, **kw):
+            content = sch_file.read_text(encoding="utf-8")
+            idx = content.rindex("  (sheet_instances")
+            sch_file.write_text(
+                content[:idx] + TestReplaceFieldRestore._NEW_BLOCK + content[idx:],
+                encoding="utf-8",
+            )
+            return {"success": True}
+
+        fake_loader_cls = type(
+            "FakeLoader",
+            (),
+            {"__init__": lambda self, **kw: None, "add_component": fake_add_component},
+        )
+        monkeypatch.setattr(sb, "DynamicSymbolLoader", fake_loader_cls)
+        fake_pins = types.SimpleNamespace(
+            get_all_symbol_pins=lambda p, ref: {},
+            get_symbol_pins=lambda p, sym: {},
+        )
+        monkeypatch.setattr(sb, "PinLocator", lambda: fake_pins)
+
+        iface = types.SimpleNamespace(
+            _handle_get_schematic_component=fake_get_component,
+            _handle_edit_schematic_component=fake_edit,
+        )
+        c = SchematicBatchCommands(iface)
+        r = c.replace_schematic_component(
+            {
+                "schematicPath": str(sch),
+                "reference": "D1",
+                "newSymbol": "Device:D_Zener",
+            }
+        )
+
+        assert r["success"] is True
+        # the library symbol definition must be untouched
+        assert '"LIBRARY TEXT"' in sch.read_text(encoding="utf-8")
+        # restoration went through the block-scoped editor with the old value
+        assert len(edit_calls) == 1
+        assert edit_calls[0]["reference"] == "D1"
+        assert edit_calls[0]["properties"]["Description"] == {"value": "OLD DESC"}

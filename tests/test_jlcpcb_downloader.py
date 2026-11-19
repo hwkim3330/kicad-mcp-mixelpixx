@@ -118,63 +118,139 @@ def test_convert_source_sqlite_produces_manager_schema(tmp_path):
     con.close()
 
 
-def _make_yaqwsx_like_source(path: Path) -> None:
-    """Create a SQLite mirroring yaqwsx's FULL-catalog schema: normalized, NO view.
+def _make_yaqwsx_source(path: Path) -> None:
+    """Create a SQLite mirroring yaqwsx's ``source-db-v2`` cache.sqlite3.
 
-    category/manufacturer are IDs in sibling tables (no v_components view), which
-    is what the real ~10GB cache.sqlite3 looks like.
+    Upstream commit "Introduce compact source cache" (2026-05-31) replaced the
+    ``components``/``categories``/``manufacturers`` layout with a denormalized
+    ``jlc_components`` plus a ``lcsc_components`` side table, and re-encoded
+    ``price`` from a JSON array into a compact CSV (``qFrom-qTo:unitPrice``).
     """
     con = sqlite3.connect(str(path))
     con.executescript("""
-        CREATE TABLE manufacturers (id INTEGER PRIMARY KEY, name TEXT);
-        CREATE TABLE categories (id INTEGER PRIMARY KEY, category TEXT, subcategory TEXT);
-        CREATE TABLE components (
-            lcsc INTEGER PRIMARY KEY,
-            category_id INTEGER,
-            mfr TEXT,
-            package TEXT,
-            joints INTEGER,
-            manufacturer_id INTEGER,
-            basic INTEGER,
-            preferred INTEGER,
-            description TEXT,
-            datasheet TEXT,
-            stock INTEGER,
-            price TEXT
+        CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+        CREATE TABLE jlc_components (
+            lcsc INTEGER PRIMARY KEY NOT NULL,
+            fetched_at INTEGER NOT NULL,
+            present INTEGER NOT NULL,
+            sync_seen INTEGER NOT NULL DEFAULT 0,
+            category TEXT NOT NULL,
+            subcategory TEXT NOT NULL,
+            mfr TEXT NOT NULL,
+            package TEXT NOT NULL,
+            joints INTEGER NOT NULL,
+            manufacturer TEXT NOT NULL,
+            library_type TEXT NOT NULL,
+            preferred INTEGER NOT NULL,
+            last_on_stock INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            datasheet TEXT NOT NULL,
+            stock INTEGER NOT NULL,
+            price TEXT NOT NULL,
+            attributes TEXT NOT NULL,
+            rohs INTEGER,
+            eccn TEXT NOT NULL,
+            assembly INTEGER,
+            assembly_process TEXT,
+            assembly_mode TEXT,
+            website_component_id TEXT,
+            attrition TEXT NOT NULL
+        );
+        CREATE TABLE lcsc_components (
+            lcsc INTEGER PRIMARY KEY NOT NULL,
+            fetched_at INTEGER NOT NULL,
+            manufacturer TEXT NOT NULL,
+            attributes TEXT NOT NULL,
+            image TEXT,
+            url_slug TEXT
         );
         """)
-    con.execute("INSERT INTO manufacturers VALUES (7, 'Texas Instruments')")
-    con.execute("INSERT INTO categories VALUES (3, 'ICs', 'LDO Regulators')")
+    con.execute("INSERT INTO meta VALUES ('format', 'source-db-v2')")
+
+    def _jlc(lcsc, mfr, manufacturer, lib_type, preferred, desc, stock, price):
+        """Insert a 0603 Ferrite Bead; only the fields under test vary per row."""
+        con.execute(
+            "INSERT INTO jlc_components VALUES "
+            "(?,0,1,0,'Filters','Ferrite Beads',?,'0603',2,?,?,?,0,?,'http://ds',?,?,"
+            "'{}',NULL,'',NULL,NULL,NULL,NULL,'{}')",
+            (lcsc, mfr, manufacturer, lib_type, preferred, desc, stock, price),
+        )
+
+    prices = "1-199:0.0189,200-599:0.0163,20000-:0.0138"
+    # Basic ("base") part with the v2 CSV price, incl. an open-ended last break.
+    _jlc(1002, "GZ1608D601TF", "Sunlord", "base", 0, "ferrite bead 600R", 892564, prices)
+    # Extended part whose jlc manufacturer is blank -> must fall back to lcsc_components.
+    _jlc(1005, "CBG160808U820T", "", "expand", 0, "ferrite bead 82R", 0, "1-999:0.0039")
     con.execute(
-        "INSERT INTO components VALUES (12345, 3, 'TLV70033', 'SOT-23-5', 5, 7, 0, 0, "
-        "'3.3V LDO', 'http://ds/12345', 0, ?)",
-        (json.dumps([{"qFrom": 1, "qTo": None, "price": 0.12}]),),
+        "INSERT INTO lcsc_components VALUES (1005, 0, 'Fenghua Advanced', '{}', NULL, NULL)"
     )
+    # Preferred part with no price at all.
+    _jlc(1006, "CBG160808U600T", "FH", "expand", 1, "ferrite bead 60R", 33781, "")
     con.commit()
     con.close()
 
 
-def test_convert_yaqwsx_schema_populates_category_and_manufacturer(tmp_path):
-    """Full-catalog (yaqwsx) source has no v_components view; the join must be built."""
+def test_convert_yaqwsx_schema_populates_prices_and_library_type(tmp_path):
+    """Regression: the source-db-v2 catalog must not convert to empty price_json.
+
+    Before the fix, ``_pick_source_relation`` fell back to the largest table
+    (``jlc_components``) but the converter still looked for a JSON ``price`` and a
+    ``basic`` column, so EVERY row landed with ``price_json == '[]'`` and no part
+    was ever classified Basic.
+    """
     source = tmp_path / "cache.sqlite3"
     target = tmp_path / "jlcpcb_parts.db"
-    _make_yaqwsx_like_source(source)
+    _make_yaqwsx_source(source)
 
     stats = jlcpcb_downloader.convert_source_sqlite(source, target)
-    assert stats["total"] == 1
+    assert stats["total"] == 3
+    assert stats["basic"] == 1  # library_type == 'base'
 
     con = sqlite3.connect(str(target))
     con.row_factory = sqlite3.Row
-    row = dict(con.execute("SELECT * FROM components WHERE lcsc='C12345'").fetchone())
+    rows = {r["lcsc"]: dict(r) for r in con.execute("SELECT * FROM components")}
     con.close()
 
-    # These would be blank without the built v_components join:
-    assert row["category"] == "ICs"
-    assert row["subcategory"] == "LDO Regulators"
-    assert row["manufacturer"] == "Texas Instruments"
-    assert row["mfr_part"] == "TLV70033"
-    assert row["library_type"] == "Extended"
-    assert json.loads(row["price_json"]) == [{"qty": 1, "price": 0.12}]
+    basic = rows["C1002"]
+    assert basic["library_type"] == "Basic"
+    assert basic["category"] == "Filters"
+    assert basic["subcategory"] == "Ferrite Beads"
+    assert basic["manufacturer"] == "Sunlord"
+    assert basic["mfr_part"] == "GZ1608D601TF"
+    assert basic["stock"] == 892564
+    # The v2 CSV price must be decoded into the manager's [{"qty","price"}] shape.
+    assert json.loads(basic["price_json"]) == [
+        {"qty": 1, "price": 0.0189},
+        {"qty": 200, "price": 0.0163},
+        {"qty": 20000, "price": 0.0138},
+    ]
+
+    # Blank jlc manufacturer falls back to the lcsc_components side table.
+    assert rows["C1005"]["manufacturer"] == "Fenghua Advanced"
+    assert json.loads(rows["C1005"]["price_json"]) == [{"qty": 1, "price": 0.0039}]
+
+    assert rows["C1006"]["library_type"] == "Preferred"
+    assert json.loads(rows["C1006"]["price_json"]) == []
+
+
+def test_normalize_price_json_handles_yaqwsx_csv():
+    """source-db-v2 encodes price as ``qFrom-qTo:unitPrice`` pairs joined by commas."""
+    norm = jlcpcb_downloader.normalize_price_json
+    assert json.loads(norm("1-199:0.0189,200-599:0.0163,20000-:0.0138")) == [
+        {"qty": 1, "price": 0.0189},
+        {"qty": 200, "price": 0.0163},
+        {"qty": 20000, "price": 0.0138},
+    ]
+    # Single open-ended break.
+    assert json.loads(norm("1-:0.5")) == [{"qty": 1, "price": 0.5}]
+    # Breaks are sorted by quantity even if the source is out of order.
+    assert json.loads(norm("100-:0.2,1-99:0.4")) == [
+        {"qty": 1, "price": 0.4},
+        {"qty": 100, "price": 0.2},
+    ]
+    # Malformed segments are skipped, not fatal.
+    assert json.loads(norm("garbage,1-9:0.1")) == [{"qty": 1, "price": 0.1}]
+    assert json.loads(norm("totally bogus")) == []
 
 
 def test_normalize_price_json_handles_scalar_and_array_and_empty():
@@ -206,6 +282,27 @@ def test_download_database_falls_through_when_no_source_available(tmp_path, monk
     assert result["success"] is False
     assert "errors" in result and len(result["errors"]) >= 1
     assert any("cdfer" in e for e in result["errors"])
+    # The real reason is in the message the client sees, not only in the log.
+    assert "network down" in result["message"]
+
+
+def test_download_database_message_mentions_7z_only_when_missing(tmp_path, monkeypatch):
+    """#454: a yaqwsx failure with 7z installed used to answer "install a 7z CLI"."""
+    monkeypatch.setattr(
+        jlcpcb_downloader.PlatformHelper, "get_data_dir", staticmethod(lambda: tmp_path)
+    )
+
+    def _boom(*a, **k):
+        raise RuntimeError("7z extraction failed: Headers Error")
+
+    monkeypatch.setattr(jlcpcb_downloader, "download_yaqwsx", _boom)
+    monkeypatch.setattr(jlcpcb_downloader, "_find_7z", lambda: "7z")
+
+    result = jlcpcb_downloader.download_database(prefer_source="yaqwsx")
+
+    assert result["success"] is False
+    assert "Headers Error" in result["message"]
+    assert "7z CLI" not in result["message"]
 
 
 def test_download_database_prefer_cdfer_converts(tmp_path, monkeypatch):
@@ -348,6 +445,23 @@ def _fake_run_factory(num_volumes, calls=None):
     return _run
 
 
+def _fake_head_factory(num_volumes, build="Sat, 25 Oct 2026 16:03:00 GMT", size=2000):
+    """Stand-in for _head: volumes 1..num_volumes and cache.zip exist upstream
+    with ``size`` bytes, cache.zip carries ``build`` as Last-Modified, and the
+    volume past the last one is a 404."""
+
+    def _head(url):
+        name = url.rsplit("/", 1)[-1]
+        if name == "cache.zip":
+            return {"status": 200, "size": size, "last_modified": build}
+        m = re.fullmatch(r"cache\.z(\d+)", name)
+        if m and int(m.group(1)) <= num_volumes:
+            return {"status": 200, "size": size, "last_modified": build}
+        return {"status": 404, "size": None, "last_modified": None}
+
+    return _head
+
+
 def test_yaqwsx_autodetects_volume_count_past_old_caps(tmp_path, monkeypatch):
     """The loop must fetch every real volume and stop at the first 404 — not a fixed cap.
 
@@ -359,6 +473,7 @@ def test_yaqwsx_autodetects_volume_count_past_old_caps(tmp_path, monkeypatch):
     monkeypatch.setattr(jlcpcb_downloader, "_find_7z", lambda: "7z")
     monkeypatch.setattr(jlcpcb_downloader.shutil, "which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(subprocess, "run", _fake_run_factory(40))
+    monkeypatch.setattr(jlcpcb_downloader, "_head", _fake_head_factory(40))
 
     cache = tmp_path / "cache"
     out = jlcpcb_downloader.download_yaqwsx(cache)
@@ -374,9 +489,9 @@ def test_yaqwsx_autodetects_volume_count_past_old_caps(tmp_path, monkeypatch):
 
 
 def test_yaqwsx_skips_existing_volumes_on_rerun(tmp_path, monkeypatch):
-    """Re-running with all volumes already present must not re-download them.
+    """Re-running with every volume of the current build complete downloads nothing.
 
-    Only the single 404 probe for the volume past the last one should hit curl.
+    The end of the archive is found with a HEAD 404, so not even a probe hits curl.
     """
     import subprocess
 
@@ -385,17 +500,88 @@ def test_yaqwsx_skips_existing_volumes_on_rerun(tmp_path, monkeypatch):
     for i in range(1, 41):
         (cache / f"cache.z{i:02d}").write_bytes(b"x" * 2000)
     (cache / "cache.zip").write_bytes(b"x" * 2000)
+    (cache / ".yaqwsx-build").write_text("Sat, 25 Oct 2026 16:03:00 GMT", encoding="utf-8")
 
     monkeypatch.setattr(jlcpcb_downloader, "_find_7z", lambda: "7z")
     monkeypatch.setattr(jlcpcb_downloader.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(jlcpcb_downloader, "_head", _fake_head_factory(40))
     calls: list = []
     monkeypatch.setattr(subprocess, "run", _fake_run_factory(40, calls=calls))
 
     out = jlcpcb_downloader.download_yaqwsx(cache)
 
     assert out.exists()
-    # No existing volume re-downloaded and cache.zip skipped — only the z41 404 probe.
-    assert calls == [f"{jlcpcb_downloader.YAQWSX_BASE_URL}/cache.z41"]
+    assert calls == []
+
+
+def test_yaqwsx_discards_volumes_from_an_older_build(tmp_path, monkeypatch):
+    """#454: yaqwsx republishes the archive daily with same-size volumes, so
+    volumes from yesterday's build plus today's cache.zip made an archive 7z
+    rejected. A changed build stamp empties the cache and fetches everything."""
+    import subprocess
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for i in range(1, 5):
+        (cache / f"cache.z{i:02d}").write_bytes(b"o" * 2000)
+    (cache / "cache.zip").write_bytes(b"o" * 2000)
+    (cache / ".yaqwsx-build").write_text("Fri, 24 Oct 2026 16:03:00 GMT", encoding="utf-8")
+
+    monkeypatch.setattr(jlcpcb_downloader, "_find_7z", lambda: "7z")
+    monkeypatch.setattr(jlcpcb_downloader.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(jlcpcb_downloader, "_head", _fake_head_factory(3))
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _fake_run_factory(3, calls=calls))
+
+    jlcpcb_downloader.download_yaqwsx(cache)
+
+    base = jlcpcb_downloader.YAQWSX_BASE_URL
+    assert calls == [
+        f"{base}/cache.z01",
+        f"{base}/cache.z02",
+        f"{base}/cache.z03",
+        f"{base}/cache.zip",
+    ]
+    assert not (cache / "cache.z04").exists()  # the old build had one more volume
+    assert (cache / ".yaqwsx-build").read_text(encoding="utf-8") == "Sat, 25 Oct 2026 16:03:00 GMT"
+
+
+def test_yaqwsx_resumes_a_truncated_volume(tmp_path, monkeypatch):
+    """A volume cut short (a timeout killed the worker mid-download, #454) used to
+    be kept because it was over 1000 bytes. Only a volume of the published size
+    is kept now; a shorter one is handed back to curl, which resumes it."""
+    import subprocess
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "cache.z01").write_bytes(b"x" * 2000)
+    (cache / "cache.z02").write_bytes(b"x" * 1500)  # truncated
+    (cache / "cache.zip").write_bytes(b"x" * 2000)
+    (cache / ".yaqwsx-build").write_text("Sat, 25 Oct 2026 16:03:00 GMT", encoding="utf-8")
+
+    monkeypatch.setattr(jlcpcb_downloader, "_find_7z", lambda: "7z")
+    monkeypatch.setattr(jlcpcb_downloader.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(jlcpcb_downloader, "_head", _fake_head_factory(2))
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _fake_run_factory(2, calls=calls))
+
+    jlcpcb_downloader.download_yaqwsx(cache)
+
+    assert calls == [f"{jlcpcb_downloader.YAQWSX_BASE_URL}/cache.z02"]
+
+
+def test_yaqwsx_failed_volume_download_is_an_error(tmp_path, monkeypatch):
+    """A volume upstream has but curl could not fetch must fail the source, not be
+    taken for the end of the archive (that is what a HEAD 404 now says)."""
+    import subprocess
+
+    monkeypatch.setattr(jlcpcb_downloader, "_find_7z", lambda: "7z")
+    monkeypatch.setattr(jlcpcb_downloader.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(jlcpcb_downloader, "_head", _fake_head_factory(3))
+    monkeypatch.setattr(subprocess, "run", _fake_run_factory(1))  # curl fails from z02 on
+
+    with pytest.raises(RuntimeError, match="cache.z02"):
+        jlcpcb_downloader.download_yaqwsx(tmp_path / "cache")
 
 
 def test_yaqwsx_max_volumes_is_a_high_safety_guard():
@@ -460,6 +646,7 @@ def test_download_yaqwsx_uses_resolved_absolute_7z_path(tmp_path, monkeypatch):
         return r
 
     monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr(jlcpcb_downloader, "_head", _fake_head_factory(1))
 
     out = jlcpcb_downloader.download_yaqwsx(tmp_path / "cache")
 

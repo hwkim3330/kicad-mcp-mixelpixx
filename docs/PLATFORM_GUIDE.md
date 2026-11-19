@@ -2,7 +2,7 @@
 
 This guide explains the differences between using KiCAD MCP Server on Linux, macOS, and Windows platforms.
 
-**Last Updated:** 2026-04-11
+**Last Updated:** 2026-09-28
 
 ---
 
@@ -11,8 +11,8 @@ This guide explains the differences between using KiCAD MCP Server on Linux, mac
 | Feature                  | Linux                     | Windows                         | macOS                   |
 | ------------------------ | ------------------------- | ------------------------------- | ----------------------- |
 | **Primary Support**      | Full (tested extensively) | Community tested                | Community tested        |
-| **Setup Complexity**     | Moderate                  | Easy (automated script)         | Easy (automated script) |
-| **Prerequisites**        | Manual package management | Automated detection             | Automated detection     |
+| **Setup Complexity**     | Easy (automated script)   | Easy (automated script)         | Easy (automated script) |
+| **Prerequisites**        | Automated detection       | Automated detection             | Automated detection     |
 | **KiCAD Python Access**  | System paths              | Bundled with KiCAD              | Bundled with KiCAD      |
 | **Path Separators**      | Forward slash (/)         | Backslash (\\) or forward slash | Forward slash (/)       |
 | **Virtual Environments** | Recommended               | Optional                        | Optional                |
@@ -30,16 +30,24 @@ This guide explains the differences between using KiCAD MCP Server on Linux, mac
 - Better tested and documented
 - More predictable Python environments
 - Standard Unix paths
+- Automated environment detection and Claude Desktop configuration
 
 **Process:**
 
-1. Install KiCAD 9.0 via package manager (apt, dnf, pacman)
+1. Install KiCAD 9.0 or higher via package manager (apt, dnf, pacman)
 2. Install Node.js via package manager or nvm
 3. Clone repository
-4. Install dependencies manually
+4. Install dependencies
 5. Build project
-6. Configure MCP client
-7. Set PYTHONPATH environment variable
+6. Run `setup-linux.sh`:
+   - `bash setup-linux.sh --verify` — check detected paths and import all Python dependencies
+   - `bash setup-linux.sh --dry-run` — preview the merged Claude Desktop config
+   - `bash setup-linux.sh --apply` — write the configuration
+
+The script keeps virtual-environment packages ahead of system KiCad modules.
+Missing or broken dependencies cause `--verify` and `--apply` to fail with an
+installation command for the selected interpreter. Install dependencies and
+rerun `--verify` before applying the configuration.
 
 **Typical paths:**
 
@@ -276,6 +284,9 @@ echo 'export PYTHONPATH=/usr/lib/kicad/lib/python3/dist-packages' >> ~/.bashrc
 # Verify pcbnew module
 /Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 -c "import pcbnew; print(pcbnew.GetBuildVersion())"
 
+# Install project dependencies using KiCAD's bundled Python
+/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 -m pip install --user -r requirements.txt
+
 # Or use the setup script to verify everything at once
 bash setup-macos.sh --verify
 ```
@@ -346,7 +357,7 @@ pytest tests/
 **View logs:**
 
 ```bash
-tail -f ~/.kicad-mcp/logs/kicad_interface.log
+tail -f $(ls -t ~/.kicad-mcp/logs/kicad_interface-*.log | head -1)
 ```
 
 **Start server manually:**
@@ -373,7 +384,7 @@ bash setup-macos.sh --verify
 **View logs:**
 
 ```bash
-tail -f ~/.kicad-mcp/logs/kicad_interface.log
+tail -f $(ls -t ~/.kicad-mcp/logs/kicad_interface-*.log | head -1)
 ```
 
 **Start server manually:**
@@ -407,7 +418,7 @@ Test-Path "C:\Program Files\KiCad\9.0"
 **View logs:**
 
 ```powershell
-Get-Content "$env:USERPROFILE\.kicad-mcp\logs\kicad_interface.log" -Tail 50 -Wait
+Get-Content (Get-ChildItem "$env:USERPROFILE\.kicad-mcp\logs\kicad_interface-*.log" | Sort-Object LastWriteTime -Descending)[0] -Tail 50 -Wait
 ```
 
 **Start server manually:**

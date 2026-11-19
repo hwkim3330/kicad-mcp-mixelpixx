@@ -8,8 +8,10 @@ No behavior change — pure relocation.
 """
 
 import base64
+import glob
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -21,13 +23,44 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import pcbnew
 import sexpdata
 from commands.library_schematic import LibraryManager as SchematicLibraryManager
-from commands.schematic import SchematicManager
+from commands.schematic import SchematicLoadError, SchematicManager
 from commands.wire_manager import WireManager
+from utils.board_items import clone_footprint
 from utils.interactive_schematic import reload_kicad_schematic
 from utils.kicad_cli import kicad_cli_not_found_message, resolve_kicad_cli
+from utils.project_settings_guard import preserve_project_settings
+from utils.sexpr_format import QUOTED_VALUE
 from utils.sexpr_format import dumps as kicad_dumps
+from utils.sexpr_format import escape_sexpr_string, unescape_sexpr_string
+from utils.skip_items import skip_items
+from utils.symbol_instances import annotate_sheet, instance_report
 
 logger = logging.getLogger("kicad_interface")
+
+
+def _xy(value: Any) -> Optional[List[float]]:
+    """A point given as [x, y] or {"x": .., "y": ..}, as [x, y]; None if neither.
+
+    Tools disagreed on the shape: add_schematic_text took a list and
+    delete_schematic_net_label a dict, and the other shape failed late with a
+    message that did not say why. Every handler that takes a position accepts both.
+    """
+    # Values are passed through as given: the writers format 100 as "100", so
+    # converting to float would change every coordinate in the file to "100.0".
+    if isinstance(value, dict):
+        x, y = value.get("x"), value.get("y")
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        x, y = value
+    else:
+        return None
+    if isinstance(x, bool) or isinstance(y, bool):
+        return None
+    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+        return [x, y]
+    return None
+
+
+_POSITION_SHAPES = '[x, y] or {"x": .., "y": ..}'
 
 
 def _find_placed_symbol_position(content: str, reference: str) -> Optional[Tuple[float, float]]:
@@ -54,25 +87,69 @@ def _find_placed_symbol_position(content: str, reference: str) -> Optional[Tuple
     return None
 
 
+def _pick_root_svg(svg_dir: str, schematic_path: str) -> Optional[str]:
+    """Return the root-page SVG produced by ``kicad-cli sch export svg``.
+
+    kicad-cli names the root page ``<schematic-stem>.svg`` and hierarchical
+    sub-sheet pages ``<stem>-<SheetName>.svg``. Returns the absolute path of
+    the stem-matched root SVG when present, the sole SVG when exactly one was
+    produced, or None when the root page cannot be identified.
+    """
+    stem = Path(schematic_path).stem
+    candidate = os.path.join(svg_dir, stem + ".svg")
+    if os.path.isfile(candidate):
+        return candidate
+    svg_files = sorted(glob.glob(os.path.join(svg_dir, "*.svg")))
+    if len(svg_files) == 1:
+        return svg_files[0]
+    return None
+
+
 def _svg_to_png(svg_path: str, width: int, height: int) -> Optional[bytes]:
-    """Convert SVG to PNG. No cffi dependency.
+    """Convert SVG to PNG at the requested pixel dimensions.
 
     Priority:
-      1. pymupdf (fitz) — bundled MuPDF renderer, pure Python, no system deps
-      2. Inkscape CLI — accurate KiCAD SVG rendering
-      3. ImageMagick convert — broad availability fallback
+      1. pymupdf (fitz) — the declared dependency (see requirements.txt).
+         Bundles the MuPDF renderer with binary wheels on all three
+         platforms, so `pip install -r requirements.txt` alone guarantees a
+         working converter — cairosvg cannot promise that on Windows, where
+         the native cairo runtime is typically absent (#274 review).
+      2. cairosvg — honors output_width/output_height; fine wherever the
+         cairo runtime exists.
+      3. Inkscape CLI — accurate KiCAD SVG rendering, if installed.
+      4. ImageMagick convert — broad availability fallback.
     Returns PNG bytes or None if all converters fail.
+
+    Rasterizing here is essential (#274): returning the raw KiCAD SVG
+    instead produces a full-sheet vector document (title block, grid, every
+    path and font) whose text easily exceeds an MCP client's inline size
+    cap, and width/height have no effect on it.
     """
     import subprocess
     import tempfile
 
     try:
         import fitz
+        from utils.swig_compat import restore_pcbnew_iterator
+
+        # pymupdf can replace pcbnew's SWIG iterator class; put it back (#479).
+        restore_pcbnew_iterator()
 
         doc = fitz.open(svg_path)
         page = doc[0]
         mat = fitz.Matrix(width / page.rect.width, height / page.rect.height)
         return page.get_pixmap(matrix=mat).tobytes("png")
+    except Exception:
+        pass
+
+    try:
+        import cairosvg
+
+        return cairosvg.svg2png(
+            url=svg_path,
+            output_width=int(width),
+            output_height=int(height),
+        )
     except Exception:
         pass
 
@@ -188,14 +265,13 @@ class SchematicHandlersMixin:
             if not filename:
                 return {"success": False, "message": "Filename is required"}
 
-            schematic = SchematicManager.load_schematic(filename)
-            success = schematic is not None
+            try:
+                schematic = SchematicManager.load_schematic(filename)
+            except SchematicLoadError as e:
+                return e.to_response()
 
-            if success:
-                metadata = SchematicManager.get_schematic_metadata(schematic)
-                return {"success": success, "metadata": metadata}
-            else:
-                return {"success": False, "message": "Failed to load schematic"}
+            metadata = SchematicManager.get_schematic_metadata(schematic)
+            return {"success": True, "metadata": metadata}
         except Exception as e:
             logger.error(f"Error loading schematic: {str(e)}")
             return {"success": False, "message": str(e)}
@@ -224,6 +300,12 @@ class SchematicHandlersMixin:
             x = component.get("x", 0)
             y = component.get("y", 0)
             unit = component.get("unit", 1)
+            # The TS layer puts these inside `component` alongside x/y/unit
+            # (src/tools/schematic.ts). Dropping them here silently ignored the
+            # documented angle/mirrorY arguments, so every symbol landed at 0°
+            # and callers had to follow up with rotate_schematic_component.
+            angle = component.get("angle", 0)
+            mirror_y = bool(component.get("mirrorY", False))
 
             # Derive project path from schematic path for project-local library resolution.
             # Walk up from the schematic file to find the directory that owns the project
@@ -248,6 +330,8 @@ class SchematicHandlersMixin:
                 x=x,
                 y=y,
                 unit=unit,
+                angle=angle,
+                mirror_y=mirror_y,
                 project_path=derived_project_path,
             )
 
@@ -260,6 +344,7 @@ class SchematicHandlersMixin:
                 "component_reference": reference,
                 "symbol_source": f"{library}:{comp_type}",
             }
+            response.update(instance_report(loader.placed_instances))
             try:
                 content = schematic_file.read_text(encoding="utf-8")
                 placed = _find_placed_symbol_position(content, reference)
@@ -288,6 +373,8 @@ class SchematicHandlersMixin:
 
             schematic_path = params.get("schematicPath")
             reference = params.get("reference")
+            delete_attached_labels = bool(params.get("deleteAttachedLabels", False))
+            unit = params.get("unit")
 
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
@@ -347,14 +434,51 @@ class SchematicHandlersMixin:
                     r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
                     block_text,
                 ):
+                    # A multi-unit part places each unit as its own block under
+                    # the same reference, so deleting by reference alone takes
+                    # the whole part. `unit` narrows it to one placement.
+                    if unit is not None:
+                        um = re.search(r"\(unit\s+(\d+)\)", block_text)
+                        if not um or int(um.group(1)) != int(unit):
+                            search_start = end + 1
+                            continue
                     blocks_to_delete.append((pos, end))
                 search_start = end + 1
 
             if not blocks_to_delete:
+                if unit is not None:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Component '{reference}' has no unit {unit} in this schematic "
+                            "(note: this tool removes schematic symbols, use delete_component "
+                            "for PCB footprints)"
+                        ),
+                    }
                 return {
                     "success": False,
                     "message": f"Component '{reference}' not found in schematic (note: this tool removes schematic symbols, use delete_component for PCB footprints)",
                 }
+
+            # Compute the doomed symbol's pin world positions BEFORE removal so
+            # the optional label cleanup knows where its labels sat.
+            target_pin_positions: List[Tuple[float, float]] = []
+            label_cleanup_warning: Optional[str] = None
+            if delete_attached_labels:
+                try:
+                    target_pin_positions = self._pin_positions_for_reference(
+                        content, reference, unit
+                    )
+                    if not target_pin_positions:
+                        logger.warning(
+                            "deleteAttachedLabels: no pin positions resolvable "
+                            "for %s (missing lib_symbols entry?); skipping "
+                            "label cleanup",
+                            reference,
+                        )
+                except Exception as e:
+                    label_cleanup_warning = f"could not compute pin positions: {e}"
+                    logger.warning("deleteAttachedLabels: %s", label_cleanup_warning)
 
             # Delete from back to front to preserve character offsets
             for b_start, b_end in sorted(blocks_to_delete, reverse=True):
@@ -371,12 +495,22 @@ class SchematicHandlersMixin:
 
             deleted_count = len(blocks_to_delete)
             logger.info(f"Deleted {deleted_count} instance(s) of {reference} from {sch_file.name}")
-            return {
+            result = {
                 "success": True,
                 "reference": reference,
                 "deleted_count": deleted_count,
                 "schematic": str(sch_file),
             }
+
+            if delete_attached_labels:
+                if label_cleanup_warning is not None:
+                    result["deleted_labels"] = []
+                    result["deleted_label_count"] = 0
+                    result["labelCleanupWarning"] = label_cleanup_warning
+                else:
+                    result.update(self._delete_dangling_labels_at(sch_file, target_pin_positions))
+
+            return result
 
         except Exception as e:
             logger.error(f"Error deleting schematic component: {e}")
@@ -386,9 +520,163 @@ class SchematicHandlersMixin:
             return {"success": False, "message": str(e)}
 
     @staticmethod
+    def _pin_positions_for_reference(
+        content: str, reference: str, unit: Optional[int] = None
+    ) -> List[Tuple[float, float]]:
+        """World (x, y) positions of every pin of every placed instance whose
+        Reference property equals ``reference``.
+
+        ``unit`` restricts this to one placement of a multi-unit part, matching
+        the units the caller actually deleted.
+
+        Builds a mini document of [lib_symbols] + [matching placed symbols]
+        and reuses WireManager._collect_pin_positions, which applies the
+        authoritative unit-aware y-negate/mirror/rotate/translate transform.
+        Returns [] when the symbol has no lib_symbols entry.
+        """
+        sym = sexpdata.Symbol("symbol")
+        lib_symbols = sexpdata.Symbol("lib_symbols")
+        prop = sexpdata.Symbol("property")
+        unit_sym = sexpdata.Symbol("unit")
+
+        def _instance_unit(instance: list) -> Optional[int]:
+            for part in instance[1:]:
+                if isinstance(part, list) and len(part) >= 2 and part[0] == unit_sym:
+                    try:
+                        return int(part[1])
+                    except (TypeError, ValueError):
+                        return None
+            return None
+
+        data = sexpdata.loads(content)
+        mini_doc: list = []
+        for item in data:
+            if not (isinstance(item, list) and item):
+                continue
+            if item[0] == lib_symbols:
+                mini_doc.append(item)
+                continue
+            if item[0] != sym:
+                continue
+            # Placed instance whose (property "Reference" "<ref>") matches
+            for part in item[1:]:
+                if (
+                    isinstance(part, list)
+                    and len(part) >= 3
+                    and part[0] == prop
+                    and str(part[1]) == "Reference"
+                    and str(part[2]) == reference
+                ):
+                    if unit is None or _instance_unit(item) == int(unit):
+                        mini_doc.append(item)
+                    break
+        return WireManager._collect_pin_positions(mini_doc)
+
+    @staticmethod
+    def _delete_dangling_labels_at(
+        sch_file: Path,
+        target_positions: List[Tuple[float, float]],
+        tolerance: float = 0.5,
+    ) -> Dict[str, Any]:
+        """Delete net labels left dangling at a removed symbol's pin positions.
+
+        Re-reads ``sch_file`` (the symbol is already gone) and removes every
+        label/global_label/hierarchical_label whose anchor lies within
+        ``tolerance`` mm of one of ``target_positions`` — unless the label is
+        still attached to something else: coincident with a remaining
+        component pin, coincident with a wire endpoint, or lying strictly on
+        a wire segment. Never raises; cleanup failure is reported via
+        ``labelCleanupWarning``.
+        """
+        try:
+            if not target_positions:
+                return {"deleted_labels": [], "deleted_label_count": 0}
+
+            with open(sch_file, "r", encoding="utf-8") as f:
+                sch_content = f.read()
+            sch_data = sexpdata.loads(sch_content)
+
+            remaining_pins = WireManager._collect_pin_positions(sch_data)
+            wire_endpoints = WireManager._collect_wire_endpoints(sch_data)
+            wire_segments = [
+                parsed
+                for parsed in (WireManager._parse_wire(item) for item in sch_data)
+                if parsed is not None
+            ]
+
+            def _near(x: float, y: float, points: List[Tuple[float, float]]) -> bool:
+                return any(
+                    abs(x - px) <= tolerance and abs(y - py) <= tolerance for px, py in points
+                )
+
+            label_types = {
+                sexpdata.Symbol("label"),
+                sexpdata.Symbol("global_label"),
+                sexpdata.Symbol("hierarchical_label"),
+            }
+            at_sym = sexpdata.Symbol("at")
+
+            deleted: List[Dict[str, Any]] = []
+            doomed_indices: List[int] = []
+            for i, item in enumerate(sch_data):
+                if not (isinstance(item, list) and item and item[0] in label_types):
+                    continue
+                at_entry = next(
+                    (p for p in item[1:] if isinstance(p, list) and len(p) >= 3 and p[0] == at_sym),
+                    None,
+                )
+                if at_entry is None:
+                    continue
+                x, y = float(at_entry[1]), float(at_entry[2])
+                if not _near(x, y, target_positions):
+                    continue
+                # Attachment guards: keep the label if it still serves live
+                # connectivity.
+                if _near(x, y, remaining_pins):
+                    continue
+                if _near(x, y, wire_endpoints):
+                    continue
+                if any(
+                    WireManager._point_strictly_on_wire(x, y, x1, y1, x2, y2)
+                    for (x1, y1), (x2, y2), _w, _t in wire_segments
+                ):
+                    continue
+                doomed_indices.append(i)
+                deleted.append(
+                    {
+                        "text": str(item[1]) if len(item) > 1 else "",
+                        "type": str(item[0]),
+                        "position": {"x": x, "y": y},
+                    }
+                )
+
+            if doomed_indices:
+                for i in reversed(doomed_indices):
+                    del sch_data[i]
+                with open(sch_file, "w", encoding="utf-8") as f:
+                    f.write(kicad_dumps(sch_data))
+                logger.info(
+                    "Deleted %d dangling label(s) at removed pin positions",
+                    len(deleted),
+                )
+
+            return {"deleted_labels": deleted, "deleted_label_count": len(deleted)}
+        except Exception as e:
+            logger.warning(f"Label cleanup after component delete failed: {e}")
+            return {
+                "deleted_labels": [],
+                "deleted_label_count": 0,
+                "labelCleanupWarning": str(e),
+            }
+
+    @staticmethod
     def _escape_sexpr_string(value: str) -> str:
-        """Escape a string for safe insertion into an S-expression double-quoted token."""
-        return value.replace("\\", "\\\\").replace('"', '\\"')
+        """Escape a string for safe insertion into an S-expression double-quoted token.
+
+        Delegates to the shared helper so escaping and unescaping cannot drift
+        apart (#336). Kept as a method because callers use it via ``self``.
+        """
+        return escape_sexpr_string(value)
 
     @staticmethod
     def _find_matching_paren(s: str, start: int) -> int:
@@ -832,15 +1120,22 @@ class SchematicHandlersMixin:
             else:
                 comp_pos = None
 
-            # Extract all properties with their at positions
+            # Extract all properties with their at positions. Name and value
+            # are read escape-aware and decoded (#336): with "([^"]*)" a value
+            # holding an escaped quote did not match and the field went
+            # missing, and a line break came back as a backslash and an "n".
             prop_pattern = re.compile(
-                r'\(property\s+"([^"]*)"\s+"([^"]*)"\s+\(at\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s*\)'
+                r"\(property\s+"
+                + QUOTED_VALUE
+                + r"\s+"
+                + QUOTED_VALUE
+                + r"\s+\(at\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s*\)"
             )
             fields = {}
             for m in prop_pattern.finditer(block_text):
                 name, value, x, y, angle = (
-                    m.group(1),
-                    m.group(2),
+                    unescape_sexpr_string(m.group(1)),
+                    unescape_sexpr_string(m.group(2)),
                     m.group(3),
                     m.group(4),
                     m.group(5),
@@ -891,18 +1186,26 @@ class SchematicHandlersMixin:
             # Make a mutable copy of points
             points = [list(p) for p in points]
 
-            # Pin snapping: adjust first and last endpoints to nearest pin
-            snapped_info = []
+            # Pin snapping: adjust first and last endpoints to nearest pin.
+            # The response says what happened to each endpoint. Snapping
+            # nothing used to be silent, so a wire drawn from a miscalculated
+            # pin position was reported as a success while floating next to
+            # the pin it was meant for (#404).
+            snapped_info: List[str] = []
+            warnings: List[str] = []
+            endpoints: Dict[str, Dict[str, Any]] = {
+                "start": {"position": list(points[0]), "snapped": False},
+                "end": {"position": list(points[-1]), "snapped": False},
+            }
             if snap_to_pins:
                 from commands.pin_locator import PinLocator
 
                 locator = PinLocator()
                 sch_path = Path(schematic_path)
 
-                # Load schematic to iterate all symbols
-                from skip import Schematic as SkipSchematic
-
-                sch = SkipSchematic(str(sch_path))
+                # Load schematic via the guarded loader so a parse failure
+                # surfaces a diagnosed SchematicLoadError instead of a crash.
+                sch = SchematicManager.load_schematic(str(sch_path))
 
                 # Collect all pin locations: list of (ref, pin_num, [x, y])
                 all_pins = []
@@ -916,40 +1219,51 @@ class SchematicHandlersMixin:
                     for pin_num, coords in pin_locs.items():
                         all_pins.append((ref, pin_num, coords))
 
-                def find_nearest_pin(point: Any, tolerance: Any) -> Any:
-                    """Find the nearest pin within tolerance of a point."""
+                def find_nearest_pin(point: Any) -> Any:
+                    """Return (ref, pin_num, coords, distance) of the closest pin."""
                     best = None
-                    best_dist = tolerance
                     for ref, pin_num, coords in all_pins:
                         dx = point[0] - coords[0]
                         dy = point[1] - coords[1]
                         dist = (dx * dx + dy * dy) ** 0.5
-                        if dist <= best_dist:
-                            best_dist = dist
-                            best = (ref, pin_num, coords)
+                        if best is None or dist < best[3]:
+                            best = (ref, pin_num, coords, dist)
                     return best
 
-                # Snap first endpoint
-                match = find_nearest_pin(points[0], snap_tolerance)
-                if match:
-                    ref, pin_num, coords = match
-                    logger.info(
-                        f"Snapped start point {points[0]} -> {coords} (pin {ref}/{pin_num})"
-                    )
-                    snapped_info.append(
-                        f"start snapped to {ref}/{pin_num} at [{coords[0]}, {coords[1]}]"
-                    )
-                    points[0] = list(coords)
-
-                # Snap last endpoint
-                match = find_nearest_pin(points[-1], snap_tolerance)
-                if match:
-                    ref, pin_num, coords = match
-                    logger.info(f"Snapped end point {points[-1]} -> {coords} (pin {ref}/{pin_num})")
-                    snapped_info.append(
-                        f"end snapped to {ref}/{pin_num} at [{coords[0]}, {coords[1]}]"
-                    )
-                    points[-1] = list(coords)
+                for label, index in (("start", 0), ("end", -1)):
+                    requested = points[index]
+                    info = endpoints[label]
+                    match = find_nearest_pin(requested)
+                    if match is None:
+                        warnings.append(
+                            f"{label} point [{requested[0]}, {requested[1]}] was not snapped: "
+                            "the schematic has no symbol pins"
+                        )
+                        continue
+                    ref, pin_num, coords, dist = match
+                    info["nearestPin"] = {
+                        "reference": ref,
+                        "pin": pin_num,
+                        "position": [coords[0], coords[1]],
+                    }
+                    info["nearestPinDistance"] = round(dist, 4)
+                    if dist <= snap_tolerance:
+                        logger.info(
+                            f"Snapped {label} point {requested} -> {coords} ({ref}/{pin_num})"
+                        )
+                        snapped_info.append(
+                            f"{label} snapped to {ref}/{pin_num} at [{coords[0]}, {coords[1]}]"
+                        )
+                        points[index] = list(coords)
+                        info["position"] = list(coords)
+                        info["snapped"] = True
+                    else:
+                        warnings.append(
+                            f"{label} point [{requested[0]}, {requested[1]}] is {dist:.2f} mm from "
+                            f"the nearest pin {ref}/{pin_num} at [{coords[0]}, {coords[1]}], "
+                            f"outside snapTolerance {snap_tolerance} mm; the endpoint was left "
+                            "where it was and the wire may be floating"
+                        )
 
             # Extract wire properties
             stroke_width = properties.get("stroke_width", 0)
@@ -976,10 +1290,21 @@ class SchematicHandlersMixin:
                 message = "Wire added successfully"
                 if snapped_info:
                     message += "; " + "; ".join(snapped_info)
+                if warnings:
+                    message += ". Warning: " + " ".join(warnings)
                 self._reload_kicad_schematic()
-                return {"success": True, "message": message}
+                result: Dict[str, Any] = {
+                    "success": True,
+                    "message": message,
+                    "endpoints": endpoints,
+                }
+                if warnings:
+                    result["warnings"] = warnings
+                return result
             else:
                 return {"success": False, "message": "Failed to add wire"}
+        except SchematicLoadError as e:
+            return e.to_response()
         except Exception as e:
             logger.error(f"Error adding wire to schematic: {str(e)}")
             import traceback
@@ -1091,9 +1416,10 @@ class SchematicHandlersMixin:
 
             schematic_path = params.get("schematicPath")
             net_name = params.get("netName")
-            position = params.get("position")
+            position = _xy(params.get("position"))
             label_type = params.get("labelType", "label")
-            orientation = params.get("orientation", 0)
+            orientation_param = params.get("orientation")
+            orientation = 0 if orientation_param is None else orientation_param
             component_ref = params.get("componentRef")
             pin_number = params.get("pinNumber")
 
@@ -1126,6 +1452,26 @@ class SchematicHandlersMixin:
                 logger.info(
                     f"Snapped label '{net_name}' to pin {component_ref}/{pin_number} at {position}"
                 )
+
+                # Orient the label along the pin unless the caller asked for a
+                # specific angle. A label inherits its text direction from its
+                # angle: 0 grows right, 180 grows left (WireManager.add_label
+                # pairs the matching justify). Defaulting to 0 on a left-facing
+                # pin — or 180 on a right-facing one — lays the text back over
+                # the symbol body, and since `justify` is not separately
+                # settable, callers could not fix it without editing the file.
+                if orientation_param is None:
+                    pin_angle = locator.get_pin_angle(
+                        Path(schematic_path), component_ref, str(pin_number)
+                    )
+                    if pin_angle is not None:
+                        # Snap the outward bearing (0=right, 90=up, 180=left,
+                        # 270=down) to the four orientations KiCad allows.
+                        orientation = int(round(pin_angle / 90.0) * 90) % 360
+                        logger.info(
+                            f"Derived label orientation {orientation}° from pin "
+                            f"{component_ref}/{pin_number} outward angle {pin_angle:.1f}°"
+                        )
             elif position is None:
                 return {
                     "success": False,
@@ -1178,6 +1524,7 @@ class SchematicHandlersMixin:
                 "success": True,
                 "message": f"Added net label '{net_name}' at {position}",
                 "actual_position": position,
+                "orientation": orientation,
             }
             if snapped_to_pin:
                 response["snapped_to_pin"] = snapped_to_pin
@@ -1298,14 +1645,23 @@ class SchematicHandlersMixin:
                         "message": f"kicad-cli SVG export failed: {result.stderr}",
                     }
 
-                # kicad-cli may name the file after the schematic, find it
-                svg_files = list(Path(tmpdir).glob("*.svg"))
+                # kicad-cli names one file per page after the schematic/sheet
+                # names — pick the root page deterministically.
+                svg_files = glob.glob(os.path.join(tmpdir, "*.svg"))
                 if not svg_files:
                     return {
                         "success": False,
                         "message": "No SVG file produced by kicad-cli",
                     }
-                svg_path = str(svg_files[0])
+                picked = _pick_root_svg(tmpdir, schematic_path)
+                if picked is None:
+                    picked = sorted(svg_files)[0]
+                    logger.warning(
+                        "Could not identify root SVG page for %s; " "falling back to %s",
+                        schematic_path,
+                        picked,
+                    )
+                svg_path = picked
 
                 if fmt == "svg":
                     with open(svg_path, "r", encoding="utf-8") as f:
@@ -1360,9 +1716,10 @@ class SchematicHandlersMixin:
                     "message": f"Schematic not found: {schematic_path}",
                 }
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            try:
+                schematic = SchematicManager.load_schematic(schematic_path)
+            except SchematicLoadError as e:
+                return e.to_response()
 
             # Optional filters
             filter_params = params.get("filter", {})
@@ -1438,6 +1795,7 @@ class SchematicHandlersMixin:
         """List all nets in a schematic with their connections"""
         logger.info("Listing schematic nets")
         try:
+            from commands.pin_locator import PinLocator
             from commands.wire_connectivity import (
                 _build_adjacency,
                 _discover_sub_sheets,
@@ -1446,16 +1804,17 @@ class SchematicHandlersMixin:
                 _parse_virtual_connections,
                 _parse_wires,
                 count_pins_on_net,
-                get_connections_for_net,
+                get_connections_for_nets,
             )
 
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            try:
+                schematic = SchematicManager.load_schematic(schematic_path)
+            except SchematicLoadError as e:
+                return e.to_response()
 
             # Collect net names from the top-level sheet using sexpdata.
             # Falls back to kicad-skip's label collections when the file
@@ -1499,9 +1858,19 @@ class SchematicHandlersMixin:
                 adjacency, iu_to_wires = [], {}
             point_to_label, label_to_points = _parse_virtual_connections(schematic, schematic_path)
 
+            # One shared locator + one batched connectivity pass: every sheet
+            # is parsed and pin-located once for the whole net list, instead of
+            # once per net (which made this handler O(nets × sheet size) and
+            # took minutes on large flat schematics).
+            sorted_net_names = sorted(net_names)
+            locator = PinLocator(memoize_pins=True)  # this request only
+            connections_by_net = get_connections_for_nets(
+                schematic, schematic_path, sorted_net_names, locator=locator
+            )
+
             nets = []
-            for net_name in sorted(net_names):
-                connections = get_connections_for_net(schematic, schematic_path, net_name)
+            for net_name in sorted_net_names:
+                connections = connections_by_net[net_name]
                 pin_count = count_pins_on_net(
                     schematic,
                     schematic_path,
@@ -1511,6 +1880,7 @@ class SchematicHandlersMixin:
                     adjacency,
                     point_to_label,
                     label_to_points,
+                    locator=locator,
                 )
                 nets.append(
                     {
@@ -1537,9 +1907,10 @@ class SchematicHandlersMixin:
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            try:
+                schematic = SchematicManager.load_schematic(schematic_path)
+            except SchematicLoadError as e:
+                return e.to_response()
 
             wires = []
             if hasattr(schematic, "wire"):
@@ -1587,9 +1958,10 @@ class SchematicHandlersMixin:
             if label_type is not None and label_type not in _valid_label_types:
                 return {"success": False, "message": "labelType must be one of: net, global, power"}
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            try:
+                schematic = SchematicManager.load_schematic(schematic_path)
+            except SchematicLoadError as e:
+                return e.to_response()
 
             labels = []
 
@@ -1664,6 +2036,19 @@ class SchematicHandlersMixin:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _unit_not_found_message(sch_data: list, reference: str, unit: Any) -> str:
+        """Explain a failed symbol lookup, naming the units that do exist."""
+        from commands.wire_dragger import WireDragger
+
+        if unit is None:
+            return f"Component {reference} not found"
+        units = WireDragger.list_symbol_units(sch_data, reference)
+        if not units:
+            return f"Component {reference} not found"
+        placed = ", ".join(str(u) for u in sorted(set(units)))
+        return f"Component {reference} has no unit {unit}; units placed here: {placed}"
+
     def _handle_move_schematic_component(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Move a schematic component to a new position, dragging connected wires."""
         logger.info("Moving schematic component")
@@ -1676,6 +2061,8 @@ class SchematicHandlersMixin:
             new_x = position.get("x")
             new_y = position.get("y")
             preserve_wires = params.get("preserveWires", True)
+            straighten = params.get("straightenWires", True)
+            unit = params.get("unit")
 
             if not schematic_path or not reference:
                 return {
@@ -1692,9 +2079,12 @@ class SchematicHandlersMixin:
                 sch_data = sexpdata.loads(f.read())
 
             # Find symbol and record old position
-            found = WireDragger.find_symbol(sch_data, reference)
+            found = WireDragger.find_symbol(sch_data, reference, unit)
             if found is None:
-                return {"success": False, "message": f"Component {reference} not found"}
+                return {
+                    "success": False,
+                    "message": self._unit_not_found_message(sch_data, reference, unit),
+                }
             _, old_x, old_y = found[0], found[1], found[2]
             old_position = {"x": old_x, "y": old_y}
 
@@ -1702,7 +2092,7 @@ class SchematicHandlersMixin:
             if preserve_wires:
                 # Compute pin world positions before and after the move
                 pin_positions = WireDragger.compute_pin_positions(
-                    sch_data, reference, float(new_x), float(new_y)
+                    sch_data, reference, float(new_x), float(new_y), unit
                 )
                 # Build old→new coordinate map (deduplicate coincident pins)
                 old_to_new = {}
@@ -1716,17 +2106,29 @@ class SchematicHandlersMixin:
                         continue
                     old_to_new[old_xy] = new_xy
 
-                drag_summary = WireDragger.drag_wires(sch_data, old_to_new)
+                # Everything that must stay put while bends are straightened:
+                # the pins of every other symbol, plus this symbol's own pins at
+                # their new positions (they are the ends we just dragged).
+                anchors = set(
+                    WireDragger.get_all_stationary_pin_positions(sch_data, reference, unit).keys()
+                )
+                anchors.update(new_xy for (_old, new_xy) in pin_positions.values())
+
+                drag_summary = WireDragger.drag_wires(
+                    sch_data, old_to_new, anchor_points=anchors, straighten=straighten
+                )
 
                 # Synthesize wires for touching-pin connections after dragging,
                 # so drag_wires doesn't accidentally move and collapse the new wire.
                 wires_synthesized = WireDragger.synthesize_touching_pin_wires(
-                    sch_data, reference, pin_positions
+                    sch_data, reference, pin_positions, moved_unit=unit
                 )
                 drag_summary["wires_synthesized"] = wires_synthesized
 
             # Update symbol position
-            WireDragger.update_symbol_position(sch_data, reference, float(new_x), float(new_y))
+            WireDragger.update_symbol_position(
+                sch_data, reference, float(new_x), float(new_y), unit
+            )
 
             WireManager.sync_junctions(sch_data)
 
@@ -1737,10 +2139,14 @@ class SchematicHandlersMixin:
                 "success": True,
                 "oldPosition": old_position,
                 "newPosition": {"x": new_x, "y": new_y},
+                "unit": unit,
                 "wiresMoved": drag_summary.get("endpoints_moved", 0),
                 "wiresRemoved": drag_summary.get("wires_removed", 0),
                 "wiresSynthesized": drag_summary.get("wires_synthesized", 0),
                 "labelsMoved": drag_summary.get("labels_moved", 0),
+                "noConnectsMoved": drag_summary.get("no_connects_moved", 0),
+                "wiresStraightened": drag_summary.get("wires_straightened", 0),
+                "wiresLeftDiagonal": drag_summary.get("wires_left_diagonal", 0),
             }
 
         except Exception as e:
@@ -1761,6 +2167,8 @@ class SchematicHandlersMixin:
             reference = params.get("reference")
             angle = params.get("angle", 0)
             mirror = params.get("mirror")  # "x", "y", or None
+            straighten = params.get("straightenWires", True)
+            unit = params.get("unit")
 
             if not schematic_path or not reference:
                 return {
@@ -1771,9 +2179,12 @@ class SchematicHandlersMixin:
             with open(schematic_path, "r", encoding="utf-8") as f:
                 sch_data = _sexpdata.loads(f.read())
 
-            found = WireDragger.find_symbol(sch_data, reference)
+            found = WireDragger.find_symbol(sch_data, reference, unit)
             if found is None:
-                return {"success": False, "message": f"Component {reference} not found"}
+                return {
+                    "success": False,
+                    "message": self._unit_not_found_message(sch_data, reference, unit),
+                }
 
             # Determine new mirror state: explicit param overrides; None preserves existing
             _, _, _, _, _, old_mirror_x, old_mirror_y = found
@@ -1788,7 +2199,7 @@ class SchematicHandlersMixin:
 
             # Compute pin world positions before and after the transform
             pin_positions = WireDragger.compute_pin_positions_for_rotation(
-                sch_data, reference, float(angle), new_mirror_x, new_mirror_y
+                sch_data, reference, float(angle), new_mirror_x, new_mirror_y, unit
             )
 
             # Build old→new map (skip pins that don't move)
@@ -1805,11 +2216,17 @@ class SchematicHandlersMixin:
                 old_to_new[old_xy] = new_xy
 
             # Drag connected wires to follow pins
-            drag_summary = WireDragger.drag_wires(sch_data, old_to_new)
+            anchors = set(
+                WireDragger.get_all_stationary_pin_positions(sch_data, reference, unit).keys()
+            )
+            anchors.update(new_xy for (_old, new_xy) in pin_positions.values())
+            drag_summary = WireDragger.drag_wires(
+                sch_data, old_to_new, anchor_points=anchors, straighten=straighten
+            )
 
             # Update the symbol's rotation and mirror token in sexpdata
             WireDragger.update_symbol_rotation_mirror(
-                sch_data, reference, float(angle), effective_mirror
+                sch_data, reference, float(angle), effective_mirror, unit
             )
 
             WireManager.sync_junctions(sch_data)
@@ -1820,11 +2237,15 @@ class SchematicHandlersMixin:
             return {
                 "success": True,
                 "reference": reference,
+                "unit": unit,
                 "angle": angle,
                 "mirror": effective_mirror,
                 "wiresMoved": drag_summary.get("endpoints_moved", 0),
                 "wiresRemoved": drag_summary.get("wires_removed", 0),
                 "labelsMoved": drag_summary.get("labels_moved", 0),
+                "noConnectsMoved": drag_summary.get("no_connects_moved", 0),
+                "wiresStraightened": drag_summary.get("wires_straightened", 0),
+                "wiresLeftDiagonal": drag_summary.get("wires_left_diagonal", 0),
             }
 
         except Exception as e:
@@ -1835,74 +2256,29 @@ class SchematicHandlersMixin:
             return {"success": False, "message": str(e)}
 
     def _handle_annotate_schematic(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Annotate unannotated components in schematic (R? -> R1, R2, ...)"""
+        """Annotate unannotated components in schematic (R? -> R1, R2, ...)
+
+        utils.symbol_instances.annotate_sheet does the work. This used kicad-skip's
+        setAllReferences, which wrote one number into every use of a sheet used
+        more than once, and it took the used numbers from this file only, so a
+        number already taken on another sheet was handed out again (#432). It
+        also gave each unit of a multi-unit part its own number.
+        """
         logger.info("Annotating schematic")
         try:
-            import re
-
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
+            if not Path(schematic_path).is_file():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
-
-            # Collect existing references by prefix
-            existing_refs = {}  # prefix -> set of numbers
-            unannotated = []  # (symbol, prefix)
-
-            for symbol in schematic.symbol:
-                if not hasattr(symbol.property, "Reference"):
-                    continue
-                ref = symbol.property.Reference.value
-                if ref.startswith("_TEMPLATE"):
-                    continue
-
-                # Split reference into prefix and number
-                match = re.match(r"^([A-Za-z_]+)(\d+)$", ref)
-                if match:
-                    prefix = match.group(1)
-                    num = int(match.group(2))
-                    if prefix not in existing_refs:
-                        existing_refs[prefix] = set()
-                    existing_refs[prefix].add(num)
-                elif ref.endswith("?"):
-                    prefix = ref[:-1]
-                    unannotated.append((symbol, prefix))
-
-            if not unannotated:
+            annotated = annotate_sheet(Path(schematic_path))
+            if not annotated:
                 return {
                     "success": True,
                     "annotated": [],
                     "message": "All components already annotated",
                 }
-
-            annotated = []
-            for symbol, prefix in unannotated:
-                if prefix not in existing_refs:
-                    existing_refs[prefix] = set()
-
-                # Find next available number
-                next_num = 1
-                while next_num in existing_refs[prefix]:
-                    next_num += 1
-
-                old_ref = symbol.property.Reference.value
-                new_ref = f"{prefix}{next_num}"
-                symbol.setAllReferences(new_ref)
-                existing_refs[prefix].add(next_num)
-
-                uuid_val = str(symbol.uuid.value) if hasattr(symbol, "uuid") else ""
-                annotated.append(
-                    {
-                        "uuid": uuid_val,
-                        "oldReference": old_ref,
-                        "newReference": new_ref,
-                    }
-                )
-
-            SchematicManager.save_schematic(schematic, schematic_path)
             return {"success": True, "annotated": annotated}
 
         except Exception as e:
@@ -1949,7 +2325,7 @@ class SchematicHandlersMixin:
         try:
             schematic_path = params.get("schematicPath")
             net_name = params.get("netName")
-            position = params.get("position")
+            raw_position = params.get("position")
 
             if not schematic_path or not net_name:
                 return {
@@ -1957,13 +2333,24 @@ class SchematicHandlersMixin:
                     "message": "schematicPath and netName are required",
                 }
 
+            # A position that is given but malformed is refused, not treated as
+            # absent: without a position the only label of that name is deleted,
+            # which is the wrong label when the caller meant to pick one.
+            pos_list = None
+            if raw_position is not None:
+                pos_list = _xy(raw_position)
+                if pos_list is None:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"position must be {_POSITION_SHAPES}, got {raw_position!r}; "
+                            "nothing was deleted"
+                        ),
+                    }
+
             from pathlib import Path
 
             from commands.wire_manager import WireManager
-
-            pos_list = None
-            if position:
-                pos_list = [position.get("x", 0), position.get("y", 0)]
 
             deleted = WireManager.delete_label(Path(schematic_path), net_name, pos_list)
             if deleted:
@@ -2086,53 +2473,60 @@ class SchematicHandlersMixin:
                     "message": f"Schematic not found: {schematic_path}",
                 }
 
-            # kicad-cli's --output flag for SVG export expects a directory, not a file path.
-            # The output file is auto-named based on the schematic name.
-            output_dir_p = Path(output_path).parent
-            if str(output_dir_p) == "":
-                output_dir_p = Path(".")
-            output_dir_p.mkdir(parents=True, exist_ok=True)
-            output_dir = str(output_dir_p)
-
             kicad_cli = resolve_kicad_cli()
             if not kicad_cli:
                 return {"success": False, "message": kicad_cli_not_found_message()}
-            cmd = [
-                kicad_cli,
-                "sch",
-                "export",
-                "svg",
-                schematic_path,
-                "-o",
-                output_dir,
-            ]
 
-            if params.get("blackAndWhite"):
-                cmd.append("--black-and-white")
+            # kicad-cli's --output flag for SVG export expects a directory, and
+            # auto-names one SVG per page after the schematic/sheet names.
+            # Export into a private temp directory so stale SVGs from earlier
+            # exports (or extra hierarchical pages) can never be picked up,
+            # then move only the root page to the requested outputPath.
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cmd = [
+                    kicad_cli,
+                    "sch",
+                    "export",
+                    "svg",
+                    schematic_path,
+                    "-o",
+                    tmpdir,
+                ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if params.get("blackAndWhite"):
+                    cmd.append("--black-and-white")
 
-            if result.returncode != 0:
-                return {
-                    "success": False,
-                    "message": f"kicad-cli failed: {result.stderr}",
-                }
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
-            # kicad-cli names the file after the schematic, so find the generated SVG
-            svg_files = list(output_dir_p.glob("*.svg"))
-            if not svg_files:
-                return {
-                    "success": False,
-                    "message": "No SVG file produced by kicad-cli",
-                }
+                if result.returncode != 0:
+                    return {
+                        "success": False,
+                        "message": f"kicad-cli failed: {result.stderr}",
+                    }
 
-            generated_svg = str(svg_files[0])
+                pages = sorted(
+                    os.path.basename(f) for f in glob.glob(os.path.join(tmpdir, "*.svg"))
+                )
+                if not pages:
+                    return {
+                        "success": False,
+                        "message": "No SVG file produced by kicad-cli",
+                    }
 
-            # Move/rename to the user-specified output path if it differs
-            if Path(generated_svg).resolve() != Path(output_path).resolve():
-                shutil.move(generated_svg, output_path)
+                root_svg = _pick_root_svg(tmpdir, schematic_path)
+                if root_svg is None:
+                    return {
+                        "success": False,
+                        "message": "Could not identify root SVG page",
+                        "files": pages,
+                    }
 
-            return {"success": True, "file": {"path": output_path}}
+                output_dir = os.path.dirname(output_path)
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                shutil.move(root_svg, output_path)
+
+            return {"success": True, "file": {"path": output_path}, "pages": pages}
 
         except FileNotFoundError:
             return {"success": False, "message": kicad_cli_not_found_message()}
@@ -2192,9 +2586,10 @@ class SchematicHandlersMixin:
                 except (TypeError, ValueError):
                     return {"success": False, "message": "Parameters x and y must be numeric"}
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            try:
+                schematic = SchematicManager.load_schematic(schematic_path)
+            except SchematicLoadError as e:
+                return e.to_response()
 
             if not hasattr(schematic, "wire"):
                 return {"success": False, "message": "Schematic has no wires"}
@@ -2255,7 +2650,7 @@ class SchematicHandlersMixin:
 
             schematic_path = params.get("schematicPath")
             text = params.get("text")
-            position = params.get("position")
+            position = _xy(params.get("position"))
             angle = params.get("angle", 0)
             font_size = params.get("fontSize", 1.27)
             bold = params.get("bold", False)
@@ -2267,7 +2662,7 @@ class SchematicHandlersMixin:
             if not text:
                 return {"success": False, "message": "text is required"}
             if not position or len(position) != 2:
-                return {"success": False, "message": "position [x, y] is required"}
+                return {"success": False, "message": f"position is required, as {_POSITION_SHAPES}"}
             if justify not in ("left", "center", "right"):
                 return {"success": False, "message": "justify must be left, center, or right"}
             if font_size <= 0:
@@ -2315,7 +2710,7 @@ class SchematicHandlersMixin:
 
             schematic_path = params.get("schematicPath")
             text = params.get("text")
-            position = params.get("position")
+            position = _xy(params.get("position"))
             shape = params.get("shape", "bidirectional")
             orientation = params.get("orientation", 0)
 
@@ -2324,7 +2719,7 @@ class SchematicHandlersMixin:
             if not text:
                 return {"success": False, "message": "text is required"}
             if not position or len(position) != 2:
-                return {"success": False, "message": "position [x, y] is required"}
+                return {"success": False, "message": f"position is required, as {_POSITION_SHAPES}"}
             if shape not in ("input", "output", "bidirectional"):
                 return {
                     "success": False,
@@ -2368,7 +2763,7 @@ class SchematicHandlersMixin:
             sheet_name = params.get("sheetName")
             pin_name = params.get("pinName")
             pin_type = params.get("pinType", "bidirectional")
-            position = params.get("position")
+            position = _xy(params.get("position"))
             orientation = params.get("orientation", 0)
 
             if not schematic_path:
@@ -2378,7 +2773,7 @@ class SchematicHandlersMixin:
             if not pin_name:
                 return {"success": False, "message": "pinName is required"}
             if not position or len(position) != 2:
-                return {"success": False, "message": "position [x, y] is required"}
+                return {"success": False, "message": f"position is required, as {_POSITION_SHAPES}"}
             if pin_type not in ("input", "output", "bidirectional"):
                 return {
                     "success": False,
@@ -2533,13 +2928,18 @@ class SchematicHandlersMixin:
             logger.error(f"Error running ERC: {str(e)}")
             return {"success": False, "message": str(e)}
 
-    def _build_hierarchical_pad_net_map(self, project_sch_path: str):
-        """Walk all .kicad_sch files in the project and build a {(ref, pin_num): net_name} map.
+    def _build_hierarchical_pad_net_map(self, project_sch_path: str, sheets_out=None):
+        """Walk the sheets reachable from the root schematic and build a
+        {(ref, pin_num): net_name} map.
 
-        Handles hierarchical schematics by scanning every sub-sheet file.  Net names
-        from global_label / hierarchical_label / local label / power symbols are all
-        collected.  Wire connectivity is traced via BFS so labels not placed directly
-        on a pin endpoint still reach through wire segments.
+        Handles hierarchical schematics by following ``(sheet ...)`` references
+        from the root.  Net names from global_label / hierarchical_label / local
+        label / power symbols are all collected, and a wired net with no label at
+        all gets the ``Net-(REF-PadN)`` name KiCad would give it.  Wire
+        connectivity is traced via BFS so labels not placed directly on a pin
+        endpoint still reach through wire segments.
+
+        ``sheets_out``, when given, receives the path of every sheet read.
 
         Returns: (pad_net_map, net_names_set)
         """
@@ -2547,7 +2947,7 @@ class SchematicHandlersMixin:
         from pathlib import Path
 
         from commands.pin_locator import PinLocator
-        from skip import Schematic
+        from utils.sheet_tree import sheet_tree
 
         TOLERANCE = 0.5  # mm; schematic grid is 1.27 mm so 0.5 is safe
 
@@ -2568,26 +2968,34 @@ class SchematicHandlersMixin:
                     return name
             return None
 
-        project_dir = Path(project_sch_path).parent
         pad_net_map: dict = {}
         all_net_names: set = set()
         pin_locator = PinLocator()
 
-        sch_files = sorted(project_dir.rglob("*.kicad_sch"))
-        logger.info(f"_build_hierarchical_pad_net_map: scanning {len(sch_files)} schematic files")
+        # Only the sheets reachable from the root are part of the design. A
+        # recursive glob of the project directory also read KiCad's .history/
+        # snapshots, this server's .mcp-backups/ copies and hand-made backup
+        # folders as live sheets, and whichever copy sorted last silently
+        # overwrote the live sheet's nets (#400).
+        sch_files = sheet_tree(Path(project_sch_path))
+        if sheets_out is not None:
+            sheets_out.extend(str(p) for p in sch_files)
+        logger.info(
+            f"_build_hierarchical_pad_net_map: scanning {len(sch_files)} sheet(s): "
+            + ", ".join(p.name for p in sch_files)
+        )
 
         for sch_path in sch_files:
-            try:
-                sch = Schematic(str(sch_path))
-            except Exception as e:
-                logger.warning(f"Could not load {sch_path}: {e}")
-                continue
+            # A broken sheet must fail the sync loudly: silently skipping it
+            # would produce an incomplete pad->net map and wrong-looking
+            # success. SchematicLoadError carries the flat-symbol diagnosis.
+            sch = SchematicManager.load_schematic(str(sch_path))
 
             # ── 1. Collect explicit label positions → net name ──────────────
             point_net: dict = {}  # snap(x,y) -> net_name
 
             for attr in ("label", "global_label", "hierarchical_label"):
-                for lbl in getattr(sch, attr, None) or []:
+                for lbl in skip_items(sch, attr):
                     try:
                         pos = lbl.at.value
                         name = lbl.value
@@ -2598,11 +3006,19 @@ class SchematicHandlersMixin:
                     except Exception:
                         pass
 
-            # Power symbols (#PWR / #FLG): value property IS the net name; use pin 1 pos
-            for sym in getattr(sch, "symbol", None) or []:
+            # Power symbols (#PWR): the Value property IS the net name; seed
+            # every pin position with it.
+            #
+            # #FLG (PWR_FLAG) is deliberately excluded. Its Value is the literal
+            # string "PWR_FLAG", an ERC marker rather than a net name. Treating
+            # it as one invented a bogus "PWR_FLAG" net and, worse, stamped that
+            # name onto the flag's pin, from where the BFS below propagated it
+            # over the real net. A PWR_FLAG takes whatever net it is wired to;
+            # it never names one.
+            for sym in skip_items(sch, "symbol"):
                 try:
                     ref = sym.property.Reference.value
-                    if not (ref.startswith("#PWR") or ref.startswith("#FLG")):
+                    if not ref.startswith("#PWR"):
                         continue
                     net_name = sym.property.Value.value
                     if not net_name:
@@ -2617,7 +3033,7 @@ class SchematicHandlersMixin:
 
             # ── 2. Build wire adjacency and BFS-propagate net names ──────────
             wire_segments = []
-            for wire in getattr(sch, "wire", None) or []:
+            for wire in skip_items(sch, "wire"):
                 try:
                     pts = []
                     for pt in wire.pts.xy:
@@ -2654,8 +3070,9 @@ class SchematicHandlersMixin:
                         visited.add(neighbor)
                         queue.append(neighbor)
 
-            # ── 3. Match component pin positions to net names ────────────────
-            for sym in getattr(sch, "symbol", None) or []:
+            # ── 3. Collect real (non-power) symbol pins with their positions ──
+            sym_pins = []  # (ref, pin_num, (px, py))
+            for sym in skip_items(sch, "symbol"):
                 try:
                     ref = sym.property.Reference.value
                     if ref.startswith("#"):
@@ -2665,9 +3082,60 @@ class SchematicHandlersMixin:
 
                 pin_positions = pin_locator.get_all_symbol_pins(sch_path, ref)
                 for pin_num, (px, py) in pin_positions.items():
-                    net = nearby_net((px, py), point_net)
-                    if net:
-                        pad_net_map[(ref, pin_num)] = net
+                    sym_pins.append((ref, pin_num, (px, py)))
+
+            # ── 3b. Name wire clusters that carry no label ────────────────────
+            # A net formed only by a wire between component pins -- no label, no
+            # power symbol -- was named by nothing above, so its pads reached the
+            # board with no net at all and the connection silently vanished from
+            # the layout (#402). KiCad names such a net itself; the rule, checked
+            # against kicad-cli 10.0.0 on synthetic schematics, is
+            # "Net-(REF-PadN)" built from the pad NUMBER (the pin's name is not
+            # used even when it has one), choosing the candidate that sorts
+            # lowest as a plain string, so R10 beats R2. Step 2's BFS floods a
+            # name across a whole connected cluster, so a cluster is either
+            # wholly named or wholly unnamed, and testing one point suffices.
+            def in_cluster(pt, cluster):
+                if snap(*pt) in cluster:
+                    return True
+                x, y = pt
+                return any(
+                    abs(x - cx) < TOLERANCE and abs(y - cy) < TOLERANCE for cx, cy in cluster
+                )
+
+            clustered: set = set()
+            for seed in sorted(all_wire_pts):
+                if seed in point_net or seed in clustered:
+                    continue
+                cluster = set()
+                stack = [seed]
+                clustered.add(seed)
+                while stack:
+                    cur = stack.pop()
+                    cluster.add(cur)
+                    for neighbor in point_adj[cur]:
+                        if neighbor not in clustered:
+                            clustered.add(neighbor)
+                            stack.append(neighbor)
+
+                candidates = [
+                    f"Net-({ref}-Pad{pin_num})"
+                    for ref, pin_num, pt in sym_pins
+                    if in_cluster(pt, cluster)
+                ]
+                # A single pin on a wire stub is a dangling wire, not a net.
+                if len(candidates) < 2:
+                    continue
+                auto_name = min(candidates)
+                for pt in cluster:
+                    point_net[pt] = auto_name
+                all_net_names.add(auto_name)
+
+            # ── 3c. Match component pin positions to net names ───────────────
+            for ref, pin_num, (px, py) in sym_pins:
+                net = nearby_net((px, py), point_net)
+                if net:
+                    pad_net_map[(ref, pin_num)] = net
 
         logger.info(
             f"_build_hierarchical_pad_net_map: {len(pad_net_map)} pin→net assignments, "
@@ -2685,9 +3153,50 @@ class SchematicHandlersMixin:
 
             schematic_path = params.get("schematicPath")
             board_path = params.get("boardPath")
+            # dryRun: compute every change on a board loaded from disk and
+            # report it, without saving or touching the loaded board. The
+            # sync overwrites board values and fields with the schematic's;
+            # on a board edited after its last sync that discards data, so an
+            # agent should be able to see the list before it happens.
+            dry_run = bool(params.get("dryRun"))
+            warnings: List[str] = []
+
+            # With the board open in KiCad (session pinned to IPC) this tool
+            # writes the file underneath the GUI, and KiCad's next save
+            # overwrites it. Swapping and deleting parts that way loses
+            # them, so both options are refused there; a preview is fine.
+            wanted = [p for p in ("replaceFootprints", "deleteUnusedFootprints") if params.get(p)]
+            if wanted and not dry_run and getattr(self, "session_backend", None) == "ipc":
+                return {
+                    "success": False,
+                    "message": (
+                        f"{' and '.join(wanted)} refused: the board is open in KiCad "
+                        "(session pinned to IPC), and KiCad's next save would overwrite "
+                        "the swaps and deletions. Close the board in KiCad and reopen "
+                        "the project, or preview with dryRun."
+                    ),
+                }
 
             # Determine board to work with
             board = None
+            if dry_run and not board_path and self.board:
+                board_path = self.board.GetFileName()
+                if not board_path:
+                    # Nothing on disk to preview against, and a preview must
+                    # not touch the loaded board: the branch below would run
+                    # the sync on it in memory.
+                    return {
+                        "success": False,
+                        "dryRun": True,
+                        "message": (
+                            "dryRun needs a board file: the loaded board has no file name. "
+                            "Save it first (save_board) or pass boardPath."
+                        ),
+                    }
+                warnings.append(
+                    "dryRun previews against the board file on disk; unsaved edits to the "
+                    "loaded board are not included."
+                )
             if board_path:
                 board = self._safe_load_board(board_path)
                 if board is None:
@@ -2728,17 +3237,76 @@ class SchematicHandlersMixin:
                     "message": f"Schematic not found. Provide schematicPath. Tried: {schematic_path}",
                 }
 
-            # Build hierarchical pad→net map (walks all sub-sheets)
-            pad_net_map, net_names = self._build_hierarchical_pad_net_map(schematic_path)
+            # Nets come from KiCad's own netlist (kicad-cli), the reference
+            # KiCad uses for "Update PCB from Schematic". The built-in
+            # geometric walker is only a fallback when kicad-cli is missing:
+            # it disagrees with KiCad across sheet boundaries (see
+            # utils/kicad_netlist.py).
+            sheets_scanned: list = []
+            netlist = None
+            kicad_cli = self._find_kicad_cli_static()
+            if kicad_cli:
+                from utils.kicad_netlist import export_netlist
+
+                netlist = export_netlist(kicad_cli, schematic_path)
+            if netlist is not None:
+                net_source = "kicad-cli"
+                pad_net_map = dict(netlist.pad_nets)
+                net_names = list(netlist.net_names)
+            else:
+                net_source = "built-in"
+                warnings.append(
+                    "kicad-cli netlist export was not available"
+                    + ("" if kicad_cli else " (kicad-cli not found)")
+                    + ", so nets were traced by the built-in walker. It can disagree "
+                    "with KiCad across sheet boundaries; check the result with run_drc "
+                    "schematicParity."
+                )
+                pad_net_map, net_names = self._build_hierarchical_pad_net_map(
+                    schematic_path, sheets_out=sheets_scanned
+                )
 
             # Add missing footprints from the schematic to the board *before*
             # we add nets and assign pads — F8 in KiCad does this implicitly
             # ("Update PCB from Schematic"), but our previous implementation
             # only mutated nets, leaving newly-added schematic symbols with no
             # PCB footprint at all.
-            added_footprints, skipped_footprints = self._add_missing_footprints_from_schematic(
-                board, schematic_path
+            # A re-annotated schematic first: KiCad matches footprints by
+            # symbol path and renames them in place, so R203 -> R299 is a
+            # rename, not a missing R299 plus an unused R203.
+            renamed_footprints = self._rename_footprints_by_symbol_path(
+                board, netlist.components if netlist else []
             )
+            added_footprints, skipped_footprints = self._add_missing_footprints_from_schematic(
+                board, schematic_path, components=netlist.components if netlist else None
+            )
+            linked_footprints = self._link_footprints_to_symbols(
+                board, netlist.components if netlist else []
+            )
+            updated_footprints, footprint_changes = self._update_footprints_from_symbols(
+                board, netlist.components if netlist else []
+            )
+            # KiCad's two opt-in "Update PCB from Schematic" options. Both need
+            # the netlist's component list, so the built-in fallback skips them.
+            replaced_footprints: List[Dict[str, str]] = []
+            if params.get("replaceFootprints") and footprint_changes:
+                if netlist is None:
+                    warnings.append("replaceFootprints needs kicad-cli's netlist; not applied.")
+                else:
+                    replaced_footprints, footprint_changes = self._replace_footprints(
+                        board, footprint_changes, schematic_path
+                    )
+            deleted_footprints: List[str] = []
+            kept_footprints: List[Dict[str, str]] = []
+            if params.get("deleteUnusedFootprints"):
+                if netlist is None:
+                    warnings.append(
+                        "deleteUnusedFootprints needs kicad-cli's netlist; not applied."
+                    )
+                else:
+                    deleted_footprints, kept_footprints = self._delete_footprints_without_symbols(
+                        board, netlist.components
+                    )
 
             # Add all nets to board
             netinfo = board.GetNetInfo()
@@ -2757,6 +3325,12 @@ class SchematicHandlersMixin:
             # Assign nets to pads (now also covers any footprints we just added)
             assigned_pads = 0
             unmatched = []
+            cleared_pads = []
+            # Pads whose net actually changes: "R1/2: OLD -> NEW" ("" = no net).
+            # pads_assigned counts every matched pad, changed or not, so a
+            # resync of an up-to-date board reports 333 assigned and 0 changed.
+            changed_pads: List[str] = []
+            netlist_refs = {r for r, _ in pad_net_map} if netlist is not None else set()
             for fp in board.GetFootprints():
                 ref = fp.GetReference()
                 for pad in fp.Pads():
@@ -2765,36 +3339,114 @@ class SchematicHandlersMixin:
                     if key in pad_net_map:
                         net_name = pad_net_map[key]
                         if nets_by_name.has_key(net_name):
+                            old = pad.GetNetname() if pad.GetNetCode() > 0 else ""
+                            if old != net_name:
+                                changed_pads.append(f"{ref}/{pad_num}: {old!r} -> {net_name!r}")
                             pad.SetNet(nets_by_name[net_name])
                             assigned_pads += 1
+                    elif ref in netlist_refs and str(pad_num) and pad.GetNetCode() > 0:
+                        cleared_pads.append(f"{ref}/{pad_num} (was {pad.GetNetname()})")
+                        pad.SetNetCode(0)
                     else:
                         unmatched.append(f"{ref}/{pad_num}")
 
-            board.Save(board_path)
+            if not dry_run:
+                with preserve_project_settings(board_path):
+                    board.Save(board_path)
 
-            # If board was loaded fresh, update internal reference
-            if params.get("boardPath"):
-                self.board = board
-                self._update_command_handlers()
+                # If board was loaded fresh, update internal reference
+                if params.get("boardPath"):
+                    self.board = board
+                    self._update_command_handlers()
+
+            # This handler wrote the board file itself. Record that write as
+            # ours: sync_schematic_to_board is a board-mutating command, so an
+            # auto-save follows it, and with the pre-sync signature still on
+            # record that auto-save -- and every later one -- refused to save,
+            # reporting the file as "changed externally".
+            if board is self.board and not dry_run:
+                self._record_board_signature()
 
             logger.info(
                 f"sync_schematic_to_board: {len(added_nets)} nets added, "
                 f"{len(added_footprints)} footprints added, {assigned_pads} pads assigned"
             )
+            # Every wired pin now carries a net (an unlabeled wire gets a
+            # Net-(REF-PadN) name), so an unmatched pad is one the schematic
+            # does not wire at all, or a pad the symbol does not have. Report
+            # all of them: a ten-entry sample buried a 25-pad failure (#400).
+            # In a preview the warnings below describe what the sync would do.
+            if footprint_changes:
+                warnings.append(
+                    f"{len(footprint_changes)} footprint(s) differ from their symbol's footprint "
+                    "and are not swapped (pass replaceFootprints to swap them): "
+                    + ", ".join(
+                        f"{c['reference']} ({c['board']} -> {c['schematic']})"
+                        for c in footprint_changes
+                    )
+                )
+            if cleared_pads:
+                warnings.append(
+                    f"{len(cleared_pads)} pad(s) are not pins of their symbol, so their "
+                    "net was cleared as KiCad does: " + ", ".join(cleared_pads)
+                )
+            if unmatched:
+                warnings.append(
+                    f"{len(unmatched)} pad(s) have no net in the schematic and were left "
+                    "unchanged: " + ", ".join(unmatched)
+                )
+                logger.warning("sync_schematic_to_board: " + warnings[-1])
+            root_dir = Path(schematic_path).parent
+            sheet_names = []
+            for p in sheets_scanned:
+                try:
+                    sheet_names.append(Path(p).relative_to(root_dir).as_posix())
+                except ValueError:
+                    sheet_names.append(Path(p).name)
+            counts = (
+                f"{len(added_footprints)} footprints added, {len(added_nets)} nets added, "
+                f"{len(changed_pads)} pad nets changed, {len(cleared_pads)} cleared, "
+                f"{len(updated_footprints)} footprints updated, "
+                f"{len(renamed_footprints)} renamed, "
+                f"{len(replaced_footprints)} replaced, {len(deleted_footprints)} deleted"
+            )
+            if kept_footprints:
+                warnings.append(
+                    f"{len(kept_footprints)} footprint(s) have no symbol but were kept: "
+                    + ", ".join(f"{k['reference']} ({k['reason']})" for k in kept_footprints)
+                )
             return {
                 "success": True,
+                "dryRun": dry_run,
                 "message": (
-                    f"PCB updated from schematic: {len(added_footprints)} footprints added, "
-                    f"{len(added_nets)} nets added, {assigned_pads} pads assigned"
+                    f"Preview only, nothing saved. Would apply: {counts}"
+                    if dry_run
+                    else f"PCB updated from schematic: {counts} ({assigned_pads} pads assigned)"
                 ),
+                "sheets_scanned": sheet_names if net_source == "built-in" else netlist.sheets,
+                "netSource": net_source,
+                "pads_changed_count": len(changed_pads),
+                "pads_changed": changed_pads,
+                "footprints_linked": linked_footprints,
+                "footprints_updated": updated_footprints,
+                "footprint_changes_pending": footprint_changes,
+                "footprints_renamed": renamed_footprints,
+                "footprints_replaced": replaced_footprints,
+                "footprints_deleted": deleted_footprints,
+                "pads_cleared": cleared_pads,
                 "nets_added": added_nets,
                 "nets_total": len(net_names),
                 "pads_assigned": assigned_pads,
+                "unmatched_pad_count": len(unmatched),
+                "unmatched_pads": unmatched,
                 "unmatched_pads_sample": unmatched[:10],
+                "warnings": warnings,
                 "footprints_added": added_footprints,
                 "footprints_skipped": skipped_footprints,
             }
 
+        except SchematicLoadError as e:
+            return e.to_response()
         except Exception as e:
             logger.error(f"Error in sync_schematic_to_board: {e}")
             import traceback
@@ -2844,11 +3496,17 @@ class SchematicHandlersMixin:
             root = tree.getroot()
             components = []
             for comp in root.findall("./components/comp"):
+                # <tstamps> carries the schematic symbol UUID -- verified
+                # against kicad-cli 10.0: a bare UUID with no sheet path
+                # (instances of a reused sheet share it). Legacy exports
+                # could comma-join several; keep the first.
+                tstamps = (comp.findtext("tstamps") or "").replace(",", " ").split()
                 components.append(
                     {
                         "reference": comp.get("ref", ""),
                         "value": comp.findtext("value", ""),
                         "footprint": comp.findtext("footprint", ""),
+                        "uuid": tstamps[0] if tstamps else "",
                     }
                 )
             return components
@@ -2918,8 +3576,384 @@ class SchematicHandlersMixin:
             self._sync_library_manager_state = self._fp_lib_tables_state(project_dir, cached)
         return cached
 
+    @staticmethod
+    def _board_symbol_uuid(fp: Any) -> str:
+        """The schematic symbol UUID a board footprint is bound to, or "".
+
+        ``GetPath().AsString()`` is ``/sheet-uuid/.../symbol-uuid`` (verified
+        against real KiCad 10); the last segment is the symbol UUID that
+        kicad-cli's netlist reports in ``<tstamps>``. Footprints placed by
+        hand have an empty path. Tolerant of test doubles without GetPath.
+        """
+        try:
+            path = fp.GetPath().AsString()
+        except Exception:
+            return ""
+        if not isinstance(path, str) or not path:
+            return ""
+        return path.rstrip("/").rsplit("/", 1)[-1]
+
+    @staticmethod
+    def _set_symbol_link(fp: Any, comp: Dict[str, str]) -> bool:
+        """Give ``fp`` the symbol path (and sheet fields) KiCad's update writes.
+
+        Returns False when the component carries no path (no kicad-cli
+        netlist) or the binding lacks the setter.
+        """
+        path = comp.get("path")
+        if not path:
+            return False
+        try:
+            fp.SetPath(pcbnew.KIID_PATH(path))
+        except Exception as exc:  # binding without KIID_PATH(str)
+            logger.warning(f"could not set symbol path on {fp.GetReference()}: {exc}")
+            return False
+        for setter, key in (("SetSheetname", "sheetname"), ("SetSheetfile", "sheetfile")):
+            if comp.get(key) and hasattr(fp, setter):
+                try:
+                    getattr(fp, setter)(comp[key])
+                except Exception:
+                    pass
+        return True
+
+    def _link_footprints_to_symbols(
+        self, board: Any, components: List[Dict[str, str]]
+    ) -> List[str]:
+        """Link board footprints that have no symbol path to their symbol, by reference.
+
+        Footprints added by earlier versions of this tool, or placed by hand,
+        carry no path, so KiCad's parity check and any later re-annotation can
+        only match them by reference. A footprint that already has a path is
+        left alone: that link is KiCad's and may be deliberate.
+        """
+        by_ref = {c["reference"]: c for c in components if c.get("reference") and c.get("path")}
+        linked: List[str] = []
+        for fp in board.GetFootprints():
+            if self._board_symbol_uuid(fp):
+                continue
+            comp = by_ref.get(fp.GetReference())
+            if comp and self._set_symbol_link(fp, comp):
+                linked.append(fp.GetReference())
+        return linked
+
+    @staticmethod
+    def _update_footprints_from_symbols(
+        board: Any, components: List[Dict[str, str]]
+    ) -> Tuple[List[str], List[Dict[str, str]]]:
+        """Carry symbol values and footprint library IDs to the matching board footprints.
+
+        KiCad's "Update PCB from Schematic" does both. Without this, a value
+        changed in the schematic stayed stale on the board, and KiCad's parity
+        check reported every such part.
+
+        A library ID with no library nickname at all (what older versions of
+        this tool wrote) gets the symbol's nickname when the footprint name
+        matches. Any other difference, in the library or in the name, is a
+        footprint change: KiCad reports it and swaps the footprint only when
+        "replace footprints" is ticked, because another library's footprint
+        of the same name can have different geometry. Those are listed in the
+        second list and left for the caller, not done silently here.
+        """
+        by_ref = {c["reference"]: c for c in components if c.get("reference")}
+        updated: List[str] = []
+        footprint_changes: List[Dict[str, str]] = []
+        for fp in board.GetFootprints():
+            comp = by_ref.get(fp.GetReference())
+            if not comp:
+                continue
+            ref = fp.GetReference()
+            changes = []
+            if comp.get("value") and fp.GetValue() != comp["value"]:
+                changes.append(f"value {fp.GetValue()!r} -> {comp['value']!r}")
+                fp.SetValue(comp["value"])
+            want = comp.get("footprint", "")
+            if ":" in want:
+                lib, name = want.split(":", 1)
+                fpid = fp.GetFPID()
+                have_lib = str(fpid.GetLibNickname())
+                have_name = str(fpid.GetLibItemName())
+                if have_name == name and not have_lib:
+                    fp.SetFPID(pcbnew.LIB_ID(lib, name))
+                    changes.append(f"library '(none)' -> {lib!r}")
+                elif have_name != name or have_lib != lib:
+                    footprint_changes.append(
+                        {
+                            "reference": ref,
+                            "board": f"{have_lib}:{have_name}" if have_lib else have_name,
+                            "schematic": want,
+                        }
+                    )
+            # Symbol fields (KiCad's parity check reports any missing or
+            # different one) and the BOM / DNP flags. Footprint is the library
+            # ID handled above; Reference and Value are not in the field list.
+            for name, value in (comp.get("fields") or {}).items():
+                if name == "Footprint":
+                    continue
+                try:
+                    existed = fp.HasField(name)
+                    if existed and fp.GetFieldText(name) == value:
+                        continue
+                    fp.SetField(name, value)
+                    if not existed:
+                        # A new field arrives hidden on the side's Fab layer, as
+                        # KiCad's own update from schematic adds it. SetField makes
+                        # it visible on F.SilkS at the footprint origin: on a real
+                        # board that printed every MPN and datasheet URL across
+                        # the silkscreen.
+                        field = next((f for f in fp.GetFields() if f.GetName() == name), None)
+                        if field is not None:
+                            field.SetVisible(False)
+                            field.SetLayer(pcbnew.B_Fab if fp.IsFlipped() else pcbnew.F_Fab)
+                    changes.append(f"field {name!r}")
+                except Exception as exc:  # binding differences across versions
+                    logger.warning(f"could not set field {name!r} on {ref}: {exc}")
+            for flag, getter, setter in (
+                ("exclude_from_bom", "IsExcludedFromBOM", "SetExcludedFromBOM"),
+                ("dnp", "IsDNP", "SetDNP"),
+            ):
+                if flag in comp and hasattr(fp, setter):
+                    want_flag = bool(comp[flag])
+                    if bool(getattr(fp, getter)()) != want_flag:
+                        getattr(fp, setter)(want_flag)
+                        changes.append(f"{flag} {want_flag}")
+            if changes:
+                updated.append(f"{ref}: " + ", ".join(changes))
+        return updated, footprint_changes
+
+    def _replace_footprints(
+        self,
+        board: Any,
+        changes: List[Dict[str, str]],
+        schematic_path: str,
+    ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        """Swap each footprint whose library ID differs from its symbol's footprint.
+
+        KiCad's "Update PCB from Schematic" does this when "Replace footprints
+        with those specified by symbols" is ticked. The new footprint takes
+        the old one's reference, value, fields, symbol link, position,
+        rotation, side and lock. Its pads get their nets in the sync's pad
+        pass afterwards. Tracks that ended on the old pads are left as they
+        are, as in KiCad.
+
+        Returns (replaced, not_replaced) with the reason for each failure.
+        """
+        from utils.board_items import delete_board_item
+
+        library_manager = self._get_project_library_manager(Path(schematic_path).parent)
+        by_ref = {fp.GetReference(): fp for fp in board.GetFootprints()}
+        replaced: List[Dict[str, str]] = []
+        failed: List[Dict[str, str]] = []
+        for change in changes:
+            ref, want = change["reference"], change["schematic"]
+            old = by_ref.get(ref)
+            lib_name, fp_name = want.split(":", 1)
+            library_path = library_manager.libraries.get(lib_name)
+            if old is None or not library_path:
+                failed.append(
+                    dict(change, reason=f"library '{lib_name}' not in fp-lib-table")
+                    if old is not None
+                    else dict(change, reason="footprint not on the board")
+                )
+                continue
+            try:
+                proto = pcbnew.FootprintLoad(library_path, fp_name)
+            except Exception as exc:
+                failed.append(dict(change, reason=f"FootprintLoad failed: {exc}"))
+                continue
+            if proto is None:
+                failed.append(dict(change, reason=f"footprint '{fp_name}' not in '{lib_name}'"))
+                continue
+            new = clone_footprint(proto)
+            new.SetFPID(pcbnew.LIB_ID(lib_name, fp_name))
+            new.SetReference(old.GetReference())
+            new.SetValue(old.GetValue())
+            for field in old.GetFields():
+                name = field.GetName()
+                if name in ("Reference", "Value", "Footprint"):
+                    continue
+                try:
+                    new.SetField(name, field.GetText())
+                except Exception:  # binding differences across versions
+                    pass
+            new.SetPath(old.GetPath())
+            if hasattr(old, "GetSheetname") and hasattr(new, "SetSheetname"):
+                new.SetSheetname(old.GetSheetname())
+                new.SetSheetfile(old.GetSheetfile())
+            board.Add(new)
+            if old.IsFlipped():
+                new.Flip(new.GetPosition(), False)
+            new.SetPosition(old.GetPosition())
+            new.SetOrientation(old.GetOrientation())
+            new.SetLocked(old.IsLocked())
+            self._copy_field_layout(old, new)
+            for flag, getter, setter in (
+                ("exclude_from_bom", "IsExcludedFromBOM", "SetExcludedFromBOM"),
+                ("dnp", "IsDNP", "SetDNP"),
+            ):
+                if hasattr(old, getter) and hasattr(new, setter):
+                    getattr(new, setter)(getattr(old, getter)())
+            delete_board_item(board, old)
+            replaced.append(dict(change))
+        return replaced, failed
+
+    @staticmethod
+    def _copy_field_layout(old: Any, new: Any) -> None:
+        """Give new's fields old's placement: position, angle, size, layer, visibility.
+
+        A footprint fresh from the library has its fields at the library's
+        offsets, and fields set with SetField come out visible. Replacing 53
+        0402s on a real board without this put every reference back at the
+        default spot and every MPN on the silkscreen: 199 silk violations.
+        KiCad's "Update PCB from Schematic" keeps the board's text layout, so
+        this does too. Call it after the new footprint has old's position,
+        side and rotation, so absolute positions carry over unchanged.
+        """
+        for field in old.GetFields():
+            name = field.GetName()
+            if name == "Reference":
+                target = new.Reference()
+            elif name == "Value":
+                target = new.Value()
+            elif hasattr(new, "HasField"):  # KiCad 10
+                target = new.GetField(name) if new.HasField(name) else None
+            else:  # KiCad 9
+                target = new.GetFieldByName(name) if hasattr(new, "GetFieldByName") else None
+            if target is None:
+                continue
+            for getter, setter in (
+                ("GetPosition", "SetPosition"),
+                ("GetTextAngle", "SetTextAngle"),
+                ("GetTextSize", "SetTextSize"),
+                ("GetTextThickness", "SetTextThickness"),
+                ("GetLayer", "SetLayer"),
+                ("IsVisible", "SetVisible"),
+                ("IsMirrored", "SetMirrored"),
+                ("GetHorizJustify", "SetHorizJustify"),
+                ("GetVertJustify", "SetVertJustify"),
+                ("IsKeepUpright", "SetKeepUpright"),
+            ):
+                if hasattr(field, getter) and hasattr(target, setter):
+                    try:
+                        getattr(target, setter)(getattr(field, getter)())
+                    except Exception:  # binding differences across versions
+                        pass
+
+    @classmethod
+    def _rename_footprints_by_symbol_path(
+        cls, board: Any, components: List[Dict[str, Any]]
+    ) -> List[str]:
+        """Give each footprint the reference of the symbol it is linked to.
+
+        KiCad matches a footprint to its symbol by path (sheet UUIDs plus the
+        symbol UUID), not by reference, so re-annotating the schematic renames
+        the footprint on the next update. Matching by reference alone made a
+        re-annotated part look like a missing R299 and an unused R203, and
+        ``deleteUnusedFootprints`` then removed the placed part.
+
+        The full path is compared, so instances of a reused sheet (same symbol
+        UUID, different sheet UUIDs) each find their own footprint. Returns
+        ``["R203 -> R299", ...]``.
+        """
+        by_path = {c["path"]: c for c in components if c.get("path") and c.get("reference")}
+        renamed: List[str] = []
+        for fp in board.GetFootprints():
+            try:
+                path = fp.GetPath().AsString()
+            except Exception:
+                continue
+            comp = by_path.get(path) if isinstance(path, str) else None
+            if comp is None or fp.GetReference() == comp["reference"]:
+                continue
+            renamed.append(f"{fp.GetReference()} -> {comp['reference']}")
+            fp.SetReference(comp["reference"])
+        return sorted(renamed)
+
+    @classmethod
+    def _delete_footprints_without_symbols(
+        cls, board: Any, components: List[Dict[str, Any]]
+    ) -> Tuple[List[str], List[Dict[str, str]]]:
+        """Remove footprints whose reference has no symbol in the schematic.
+
+        KiCad's "Delete footprints with no symbols". Footprints marked
+        board-only (mounting holes, logos, fiducials) are kept, as KiCad
+        keeps them, and so are locked ones, which are reported instead.
+
+        Two symbol-link guards keep a footprint whose reference is not in
+        the netlist (the rename step normally renames such a part first):
+        - its full symbol path is a netlist component's path: it is that
+          symbol's part, whatever its reference says;
+        - its symbol UUID matches a netlist component that has no footprint
+          at its own full path on the board: a stale path for a symbol that
+          is otherwise unplaced.
+        The UUID alone is not enough: every instance of a reused sheet
+        shares it, so a deleted instance's footprints (Q301) would match the
+        live instance's symbols (Q201), which already have their footprints.
+        """
+        from utils.board_items import delete_board_item
+
+        refs = {c["reference"] for c in components if c.get("reference")}
+        by_path: Dict[str, str] = {}
+        by_uuid: Dict[str, List[Tuple[str, str]]] = {}
+        for c in components:
+            path = (c.get("path") or "").rstrip("/")
+            if path and c.get("reference"):
+                by_path[path] = c["reference"]
+                by_uuid.setdefault(path.rsplit("/", 1)[-1], []).append((path, c["reference"]))
+        claimed_paths = set()
+        for fp in board.GetFootprints():
+            try:
+                fp_path = fp.GetPath().AsString()
+            except Exception:
+                continue
+            if isinstance(fp_path, str) and fp_path:
+                claimed_paths.add(fp_path.rstrip("/"))
+        board_only = getattr(pcbnew, "FP_BOARD_ONLY", 0)
+        deleted: List[str] = []
+        kept: List[Dict[str, str]] = []
+        for fp in list(board.GetFootprints()):
+            ref = fp.GetReference()
+            if ref in refs:
+                continue
+            try:
+                fp_path = fp.GetPath().AsString()
+            except Exception:
+                fp_path = ""
+            fp_path = fp_path.rstrip("/") if isinstance(fp_path, str) else ""
+            if fp_path and fp_path in by_path:
+                kept.append(
+                    {
+                        "reference": ref,
+                        "reason": f"its symbol path is schematic symbol {by_path[fp_path]}'s; "
+                        "not deleted",
+                    }
+                )
+                continue
+            unplaced = [
+                (path, sym_ref)
+                for path, sym_ref in by_uuid.get(cls._board_symbol_uuid(fp), [])
+                if path not in claimed_paths
+            ]
+            if unplaced:
+                kept.append(
+                    {
+                        "reference": ref,
+                        "reason": "its symbol UUID matches schematic symbol "
+                        + ", ".join(f"{r} ({p})" for p, r in unplaced)
+                        + ", which has no footprint at that path; not deleted",
+                    }
+                )
+                continue
+            if board_only and fp.GetAttributes() & board_only:
+                continue
+            if fp.IsLocked():
+                kept.append({"reference": ref, "reason": "locked; not deleted"})
+                continue
+            delete_board_item(board, fp)
+            deleted.append(ref)
+        return sorted(deleted), kept
+
     def _add_missing_footprints_from_schematic(
-        self, board: Any, schematic_path: str
+        self, board: Any, schematic_path: str, components: Optional[List[Dict[str, str]]] = None
     ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         """Add footprints to ``board`` for any schematic component not yet present.
 
@@ -2935,13 +3969,37 @@ class SchematicHandlersMixin:
         added: List[Dict[str, str]] = []
         skipped: List[Dict[str, str]] = []
 
-        components = self._extract_components_from_schematic(schematic_path)
+        if components is None:
+            components = self._extract_components_from_schematic(schematic_path)
         if not components:
             return added, skipped
 
         existing_refs = {fp.GetReference() for fp in board.GetFootprints()}
+
+        # Board footprints bound (by symbol UUID) to a schematic symbol whose
+        # reference no netlist comp claims: the #250 shape. A schematic that
+        # was re-annotated after layout matches nothing by reference, and
+        # adding a second copy of every such part duplicates the board. The
+        # UUID says "same symbol, different name" -- skip the add and say so.
+        # Reused-sheet instances share a symbol UUID, hence the list: each
+        # unmatched comp claims one unclaimed footprint.
+        sch_refs = {c["reference"] for c in components if c.get("reference")}
+        unclaimed_by_uuid: Dict[str, List[Any]] = {}
+        for fp in board.GetFootprints():
+            fp_uuid = self._board_symbol_uuid(fp)
+            if fp_uuid and fp.GetReference() not in sch_refs:
+                unclaimed_by_uuid.setdefault(fp_uuid, []).append(fp)
+
         project_dir = Path(schematic_path).parent
         library_manager = self._get_project_library_manager(project_dir)
+
+        # One FootprintLoad per distinct (library, footprint), cloned per use.
+        # Measured on a 40-component board (#248): FootprintLoad costs the same
+        # every time -- nothing downstream memoizes it -- so a board with 13
+        # identical resistors paid for 13 identical disk reads. Scoped to this
+        # call rather than process-wide so an edited library is never served
+        # stale.
+        proto_cache: Dict[Tuple[str, str], Any] = {}
 
         for comp in components:
             ref = comp["reference"]
@@ -2949,8 +4007,34 @@ class SchematicHandlersMixin:
             if not ref or ref.startswith("#"):
                 # Power flags / global indicators — no PCB footprint expected.
                 continue
+            if comp.get("exclude_from_board"):
+                # Symbol marked "exclude from board": KiCad adds no footprint.
+                continue
             if ref in existing_refs:
                 continue
+
+            claimed = unclaimed_by_uuid.get(comp.get("uuid", ""))
+            if claimed:
+                board_fp = claimed.pop(0)
+                board_ref = board_fp.GetReference()
+                logger.warning(
+                    f"sync: schematic '{ref}' is already on the board as "
+                    f"'{board_ref}' (same symbol UUID, references diverged) "
+                    "-- not adding a duplicate footprint (#250)"
+                )
+                skipped.append(
+                    {
+                        "reference": ref,
+                        "footprint": fp_str,
+                        "reason": (
+                            f"already on board as '{board_ref}' (same schematic "
+                            "symbol, references diverged -- re-annotate or rename "
+                            "to reconcile; no duplicate added)"
+                        ),
+                    }
+                )
+                continue
+
             if not fp_str or ":" not in fp_str:
                 skipped.append(
                     {
@@ -2973,8 +4057,17 @@ class SchematicHandlersMixin:
                 )
                 continue
 
+            cache_key = (library_path, fp_name)
             try:
-                module = pcbnew.FootprintLoad(library_path, fp_name)
+                if cache_key not in proto_cache:
+                    proto_cache[cache_key] = pcbnew.FootprintLoad(library_path, fp_name)
+                prototype = proto_cache[cache_key]
+                # Always clone, including the first use: the prototype must
+                # never be handed to board.Add(), or the cache would be left
+                # holding a board-owned object that later gets mutated and
+                # invalidated on save/reload. Cloning costs ~0.01 ms against
+                # ~15 ms for a FootprintLoad.
+                module = clone_footprint(prototype) if prototype is not None else None
             except Exception as e:
                 skipped.append(
                     {"reference": ref, "footprint": fp_str, "reason": f"FootprintLoad failed: {e}"}
@@ -2995,6 +4088,9 @@ class SchematicHandlersMixin:
             if comp["value"]:
                 module.SetValue(comp["value"])
             module.SetFPID(pcbnew.LIB_ID(lib_name, fp_name))
+            # Link to the symbol the way KiCad does, so later syncs, parity
+            # checks and back-annotation find it by path, not by reference.
+            self._set_symbol_link(module, comp)
             # Place at board origin; user / autoplacer can position from there.
             module.SetPosition(pcbnew.VECTOR2I(0, 0))
 
@@ -3053,15 +4149,22 @@ class SchematicHandlersMixin:
                         "message": f"SVG export failed: {result.stderr}",
                     }
 
-                # kicad-cli names the file after the schematic
-                tmp_dir_p = Path(tmp_dir)
-                svg_files = [p for p in tmp_dir_p.iterdir() if p.suffix == ".svg"]
+                # kicad-cli names one file per page after the schematic/sheet
+                # names — pick the root page deterministically.
+                svg_files = [f for f in os.listdir(tmp_dir) if f.endswith(".svg")]
                 if not svg_files:
                     return {
                         "success": False,
                         "message": "kicad-cli produced no SVG output",
                     }
-                svg_output = str(svg_files[0])
+                svg_output = _pick_root_svg(tmp_dir, schematic_path)
+                if svg_output is None:
+                    svg_output = os.path.join(tmp_dir, sorted(svg_files)[0])
+                    logger.warning(
+                        "Could not identify root SVG page for %s; " "falling back to %s",
+                        schematic_path,
+                        svg_output,
+                    )
 
                 import xml.etree.ElementTree as ET
 
@@ -3086,7 +4189,7 @@ class SchematicHandlersMixin:
                         root.set("height", str(height))
 
                 # Write modified SVG
-                cropped_svg_path = str(tmp_dir_p / "cropped.svg")
+                cropped_svg_path = os.path.join(tmp_dir, "cropped.svg")
                 tree.write(cropped_svg_path, xml_declaration=True, encoding="utf-8")
 
                 if out_format == "svg":
@@ -3123,18 +4226,29 @@ class SchematicHandlersMixin:
         try:
             from pathlib import Path
 
-            from commands.schematic_analysis import find_wires_crossing_symbols
+            from commands.schematic_analysis import (
+                find_pins_on_wire_interiors,
+                find_wires_crossing_symbols,
+            )
 
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
             result = find_wires_crossing_symbols(Path(schematic_path))
+            # A pin drawn on the middle of a wire is the same kind of drawing mistake.
+            # It gets its own key so `collisions` and `count` keep their meaning (#522).
+            pins_on_wire = find_pins_on_wire_interiors(Path(schematic_path))
             return {
                 "success": True,
                 "collisions": result,
                 "count": len(result),
-                "message": f"Found {len(result)} wire(s) crossing symbols",
+                "pinsOnWireInterior": pins_on_wire,
+                "pinsOnWireInteriorCount": len(pins_on_wire),
+                "message": (
+                    f"Found {len(result)} wire(s) crossing symbols and "
+                    f"{len(pins_on_wire)} pin(s) on a wire's interior, not connected to it"
+                ),
             }
         except Exception as e:
             logger.error(f"Error checking wire collisions: {e}")
@@ -3161,6 +4275,8 @@ class SchematicHandlersMixin:
                 **result,
                 "message": f"Found {result['count']} orphaned wire(s)",
             }
+        except SchematicLoadError as e:
+            return e.to_response()
         except Exception as e:
             logger.error(f"Error finding orphaned wires: {e}")
             import traceback
@@ -3178,9 +4294,10 @@ class SchematicHandlersMixin:
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            try:
+                schematic = SchematicManager.load_schematic(schematic_path)
+            except SchematicLoadError as e:
+                return e.to_response()
 
             labels = list_floating_labels(schematic, schematic_path)
             return {
@@ -3223,6 +4340,60 @@ class SchematicHandlersMixin:
             }
         except Exception as e:
             logger.error(f"Error snapping to grid: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_lint_offgrid(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Report (and optionally fix) off-grid connection geometry"""
+        logger.info("Linting schematic for off-grid geometry")
+        try:
+            from commands.schematic_lint_grid import lint_offgrid
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not os.path.isfile(schematic_path):
+                return {
+                    "success": False,
+                    "message": f"Schematic not found: {schematic_path}",
+                }
+
+            fix = bool(params.get("fix", False))
+            grid_size = float(params.get("gridSize", 1.27))
+            if grid_size <= 0:
+                return {"success": False, "message": "gridSize must be > 0"}
+
+            result = lint_offgrid(schematic_path, grid_mm=grid_size, fix=fix)
+            offender_count = len(result["offenders"])
+            if offender_count == 0:
+                message = f"No off-grid geometry (grid {grid_size} mm)"
+            elif fix:
+                message = (
+                    f"Snapped {result['fixed']} of {offender_count} off-grid "
+                    f"item(s) to the {grid_size} mm grid"
+                    + (
+                        f"; {result['needsHuman']} offender(s) >0.5mm off-grid "
+                        f"left untouched (needsHuman)"
+                        if result["needsHuman"]
+                        else ""
+                    )
+                )
+            else:
+                message = (
+                    f"Found {offender_count} off-grid item(s) on the "
+                    f"{grid_size} mm grid ({result['needsHuman']} needing "
+                    f"human review); run with fix=true to snap them"
+                )
+            return {
+                "success": True,
+                "gridSize": grid_size,
+                **result,
+                "message": message,
+            }
+        except Exception as e:
+            logger.error(f"Error linting off-grid geometry: {e}")
             import traceback
 
             logger.error(traceback.format_exc())

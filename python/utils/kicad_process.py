@@ -185,9 +185,17 @@ class KiCADProcessManager:
                 Path("/Applications/KiCad/pcbnew.app/Contents/MacOS/pcbnew"),
             ]
         elif system == "Windows":
-            candidates = [
+            from utils.kicad_roots import kicad_install_roots
+
+            # Every discovered install root first, newest version first: the
+            # registry, Program Files and custom roots such as C:\KiCad\<ver>
+            # (#286). The fixed locations stay as a last resort.
+            candidates = [root / "bin" / "pcbnew.exe" for root in kicad_install_roots()]
+            candidates += [
+                Path("C:/Program Files/KiCad/10.0/bin/pcbnew.exe"),
                 Path("C:/Program Files/KiCad/9.0/bin/pcbnew.exe"),
                 Path("C:/Program Files/KiCad/8.0/bin/pcbnew.exe"),
+                Path("C:/Program Files (x86)/KiCad/10.0/bin/pcbnew.exe"),
                 Path("C:/Program Files (x86)/KiCad/9.0/bin/pcbnew.exe"),
             ]
         else:
@@ -291,17 +299,28 @@ class KiCADProcessManager:
                         and "kicad_interface.py" not in line
                         and "grep" not in line
                     ):
-                        # More specific check: must have /pcbnew or /kicad in the path
-                        if "/pcbnew" in line or "/kicad" in line or "KiCad.app" in line:
-                            parts = line.split()
-                            if len(parts) >= 11:
-                                processes.append(
-                                    {
-                                        "pid": parts[1],
-                                        "name": parts[10],
-                                        "command": " ".join(parts[10:]),
-                                    }
-                                )
+                        parts = line.split()
+                        if len(parts) < 11:
+                            continue
+                        proc_name = parts[10]
+                        # ps shows a bare command name (no leading slash) when the
+                        # process was launched via $PATH lookup rather than an
+                        # absolute path, so also accept an exact "kicad"/"pcbnew"
+                        # basename alongside the path-based checks.
+                        base_name = proc_name.rsplit("/", 1)[-1].lower()
+                        if (
+                            "/pcbnew" in line
+                            or "/kicad" in line
+                            or "KiCad.app" in line
+                            or base_name in ("kicad", "pcbnew")
+                        ):
+                            processes.append(
+                                {
+                                    "pid": parts[1],
+                                    "name": proc_name,
+                                    "command": " ".join(parts[10:]),
+                                }
+                            )
 
             elif system == "Windows":
                 for proc in KiCADProcessManager._windows_list_processes():

@@ -11,10 +11,11 @@ import re
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from utils.kicad_roots import kicad_install_roots
 from utils.platform_helper import PlatformHelper
+from utils.sexpr_format import QUOTED_VALUE, unescape_sexpr_string
 
 logger = logging.getLogger("kicad_interface")
 
@@ -137,30 +138,21 @@ class SymbolLibraryManager:
         logger.info(f"Loaded {len(self.libraries)} symbol libraries")
 
     def _get_global_sym_lib_table(self) -> Optional[Path]:
-        """Get path to global sym-lib-table file"""
-        # Try different possible locations (same as fp-lib-table but for symbols)
-        kicad_config_paths = [
-            Path.home() / ".config" / "kicad" / "10.0" / "sym-lib-table",
-            Path.home() / ".config" / "kicad" / "9.0" / "sym-lib-table",
-            Path.home() / ".config" / "kicad" / "8.0" / "sym-lib-table",
-            Path.home() / ".config" / "kicad" / "sym-lib-table",
-            # Windows paths
-            Path.home() / "AppData" / "Roaming" / "kicad" / "10.0" / "sym-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "9.0" / "sym-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "8.0" / "sym-lib-table",
-            # macOS paths
-            Path.home() / "Library" / "Preferences" / "kicad" / "10.0" / "sym-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "sym-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "sym-lib-table",
-        ]
+        """The global sym-lib-table to read.
 
-        for path in kicad_config_paths:
-            if path.exists():
-                return path
+        Same discovery as the table editor and the footprint side; see
+        ``library_tables.global_table_for_reading``.
+        """
+        from commands.library_tables import global_table_for_reading
 
-        return None
+        return global_table_for_reading("symbol")
 
-    def _parse_sym_lib_table(self, table_path: Path) -> None:
+    def _parse_sym_lib_table(
+        self,
+        table_path: Path,
+        _seen: Optional[Set[str]] = None,
+        _vars: Optional[Dict[str, Optional[str]]] = None,
+    ) -> None:
         """
         Parse sym-lib-table file
 
@@ -168,7 +160,17 @@ class SymbolLibraryManager:
         (sym_lib_table
           (lib (name "Library_Name")(type KiCad)(uri "${KICAD9_SYMBOL_DIR}/Library.kicad_sym")(options "")(descr "Description"))
         )
+
+        A ``(type "Table")`` row names another table to read in its place.
+        KiCad 10's global table is one such row,
+        ``${KICAD10_TEMPLATE_DIR}/sym-lib-table``, standing for every stock
+        library, so its URI goes through the same variable resolution as a
+        library's. ``_seen`` stops a table that includes itself; ``_vars`` is
+        the path-variable map, built once for the whole load.
         """
+        seen = _seen if _seen is not None else set()
+        seen.add(os.path.realpath(table_path))
+        path_vars = _vars if _vars is not None else self._path_vars()
         try:
             with open(table_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -188,16 +190,19 @@ class SymbolLibraryManager:
                 uri = match.group(5) or match.group(6)
 
                 if lib_type.lower() == "table":
-                    table_uri = uri
-                    if os.path.isabs(table_uri) and os.path.isfile(table_uri):
-                        logger.info(f"  Following Table reference: {nickname} -> {table_uri}")
-                        self._parse_sym_lib_table(Path(table_uri))
+                    table_uri = self._resolve_uri(uri, path_vars)
+                    if table_uri and os.path.isfile(table_uri):
+                        if os.path.realpath(table_uri) in seen:
+                            logger.warning(f"  Skipping Table reference already read: {nickname}")
+                        else:
+                            logger.info(f"  Following Table reference: {nickname} -> {table_uri}")
+                            self._parse_sym_lib_table(Path(table_uri), seen, path_vars)
                     else:
-                        logger.warning(f"  Could not resolve Table URI: {table_uri}")
+                        logger.warning(f"  Could not resolve Table URI: {uri}")
                     continue
 
                 # Resolve environment variables in URI
-                resolved_uri = self._resolve_uri(uri)
+                resolved_uri = self._resolve_uri(uri, path_vars)
 
                 if resolved_uri:
                     self.libraries[nickname] = resolved_uri
@@ -208,30 +213,31 @@ class SymbolLibraryManager:
         except Exception as e:
             logger.error(f"Error parsing sym-lib-table at {table_path}: {e}")
 
-    def _resolve_uri(self, uri: str) -> Optional[str]:
-        """
-        Resolve environment variables and paths in library URI
+    def _path_vars(self) -> Dict[str, Optional[str]]:
+        """Every path variable a sym-lib-table URI can reference.
 
-        Handles:
-        - ${KICAD9_SYMBOL_DIR} -> /Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols
-        - ${KICAD9_3RD_PARTY} -> ~/Documents/KiCad/9.0/3rdparty
-        - ${KIPRJMOD} -> project directory
-        - Relative paths
-        - Absolute paths
+        Computed once per table load and shared by every row: each finder
+        reads the filesystem (``load_kicad_env_vars`` and the 3rd-party finder
+        both re-read kicad_common.json), and a stock KiCad 10 table has 220+
+        rows once its ``(type "Table")`` row is followed.
         """
-        resolved = uri
-
-        # Common KiCAD environment variables
-        env_vars = {
-            "KICAD10_SYMBOL_DIR": self._find_kicad_symbol_dir(),
-            "KICAD9_SYMBOL_DIR": self._find_kicad_symbol_dir(),
-            "KICAD8_SYMBOL_DIR": self._find_kicad_symbol_dir(),
-            "KICAD_SYMBOL_DIR": self._find_kicad_symbol_dir(),
-            "KICAD10_3RD_PARTY": self._find_3rd_party_dir(),
-            "KICAD9_3RD_PARTY": self._find_3rd_party_dir(),
-            "KICAD8_3RD_PARTY": self._find_3rd_party_dir(),
-            "KICAD_3RD_PARTY": self._find_3rd_party_dir(),
-            "KISYSSYM": self._find_kicad_symbol_dir(),
+        symbol_dir = self._find_kicad_symbol_dir()
+        third_party_dir = self._find_3rd_party_dir()
+        template_dir = PlatformHelper.find_kicad_template_dir()
+        env_vars: Dict[str, Optional[str]] = {
+            "KICAD10_SYMBOL_DIR": symbol_dir,
+            "KICAD9_SYMBOL_DIR": symbol_dir,
+            "KICAD8_SYMBOL_DIR": symbol_dir,
+            "KICAD_SYMBOL_DIR": symbol_dir,
+            "KICAD10_3RD_PARTY": third_party_dir,
+            "KICAD9_3RD_PARTY": third_party_dir,
+            "KICAD8_3RD_PARTY": third_party_dir,
+            "KICAD_3RD_PARTY": third_party_dir,
+            "KISYSSYM": symbol_dir,
+            "KICAD10_TEMPLATE_DIR": template_dir,
+            "KICAD9_TEMPLATE_DIR": template_dir,
+            "KICAD8_TEMPLATE_DIR": template_dir,
+            "KICAD_TEMPLATE_DIR": template_dir,
         }
 
         # Merge user-defined env vars from kicad_common.json
@@ -240,6 +246,27 @@ class SymbolLibraryManager:
         # Project directory
         if self.project_path:
             env_vars["KIPRJMOD"] = str(self.project_path)
+        return env_vars
+
+    def _resolve_uri(
+        self, uri: str, path_vars: Optional[Dict[str, Optional[str]]] = None
+    ) -> Optional[str]:
+        """
+        Resolve environment variables and paths in library URI
+
+        Handles:
+        - ${KICAD9_SYMBOL_DIR} -> /Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols
+        - ${KICAD10_3RD_PARTY} -> ~/Documents/KiCad/10.0/3rdparty
+        - ${KICAD10_TEMPLATE_DIR} -> KiCad's template directory (stock tables)
+        - ${KIPRJMOD} -> project directory
+        - Relative paths
+        - Absolute paths
+
+        ``path_vars`` is the map from ``_path_vars``; table parsing passes one
+        map for every row instead of rebuilding it per URI.
+        """
+        resolved = uri
+        env_vars = path_vars if path_vars is not None else self._path_vars()
 
         # Replace environment variables
         for var, value in env_vars.items():
@@ -290,28 +317,12 @@ class SymbolLibraryManager:
         return None
 
     def _find_3rd_party_dir(self) -> Optional[str]:
-        """Find KiCAD 3rd party library directory (PCM installed libs)"""
-        possible_paths = [
-            str(Path.home() / "Documents" / "KiCad" / "10.0" / "3rdparty"),
-            str(Path.home() / "Documents" / "KiCad" / "9.0" / "3rdparty"),
-            str(Path.home() / "Documents" / "KiCad" / "8.0" / "3rdparty"),
-        ]
+        """Find KiCAD 3rd party library directory (PCM installed libs).
 
-        # Check environment variable
-        if "KICAD10_3RD_PARTY" in os.environ:
-            possible_paths.insert(0, os.environ["KICAD10_3RD_PARTY"])
-        if "KICAD9_3RD_PARTY" in os.environ:
-            possible_paths.insert(0, os.environ["KICAD9_3RD_PARTY"])
-        if "KICAD8_3RD_PARTY" in os.environ:
-            possible_paths.insert(0, os.environ["KICAD8_3RD_PARTY"])
-        if "KICAD_3RD_PARTY" in os.environ:
-            possible_paths.insert(0, os.environ["KICAD_3RD_PARTY"])
-
-        for path in possible_paths:
-            if os.path.isdir(path):
-                return path
-
-        return None
+        Shared with the footprint side; see
+        PlatformHelper.find_kicad_3rd_party_dir for the resolution order.
+        """
+        return PlatformHelper.find_kicad_3rd_party_dir()
 
     def _parse_kicad_sym_file(self, library_path: str, library_name: str) -> List[SymbolInfo]:
         """
@@ -420,11 +431,11 @@ class SymbolLibraryManager:
         properties = {}
 
         # Pattern for properties: (property "KEY" "VALUE" ...)
-        prop_pattern = r'\(property\s+"([^"]+)"\s+"([^"]*)"'
+        prop_pattern = r"\(property\s+" + QUOTED_VALUE + r"\s+" + QUOTED_VALUE
 
         for match in re.finditer(prop_pattern, symbol_block):
-            key = match.group(1)
-            value = match.group(2)
+            key = unescape_sexpr_string(match.group(1))
+            value = unescape_sexpr_string(match.group(2))
             properties[key] = value
 
         return properties

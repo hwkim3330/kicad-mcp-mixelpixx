@@ -1,7 +1,7 @@
 # Known Issues & Workarounds
 
-**Last Updated:** 2026-03-21
-**Version:** 2.2.3
+**Last Updated:** 2026-09-01
+**Version:** 2.7.0
 
 This document tracks known issues and provides workarounds where available.
 
@@ -77,13 +77,77 @@ AttributeError: 'BOARD' object has no attribute 'LT_USER'
 
 ---
 
-### 5. package.json Version Mismatch
+### 5. `.kicad_pro` net_settings Must Be Edited via JSON Merge
 
-**Status:** KNOWN - Non-critical
+**Status:** BY DESIGN (guard added)
 
-**Symptoms:** package.json shows version 2.1.0-alpha while CHANGELOG documents version 2.2.3
+Backend board saves are wrapped in `preserve_project_settings()`
+(`python/utils/project_settings_guard.py`): pcbnew serializes a possibly
+stale in-memory project model over `.kicad_pro` on every
+`SaveBoard`/`BOARD.Save`, so the guard restores the on-disk
+`net_settings` (and any dropped top-level keys) after each save.
 
-**Impact:** Cosmetic only. CHANGELOG.md is the authoritative version reference.
+**Implication:** commands must persist net class / netclass_patterns
+changes via direct JSON read-modify-write of the `.kicad_pro` (the
+`persist_netclass_to_project` pattern in `python/commands/routing.py`),
+never through the pcbnew project model — model-side changes to
+`net_settings` are intentionally reverted by the guard.
+
+### 6. Flat Vendor Symbols Break kicad-skip-Based Tools (now diagnosed)
+
+**Status:** MITIGATED — loud structured errors
+
+SnapEDA/SamacSys `.kicad_sym` captures put pins/graphics directly under the
+top-level `(symbol "NAME" ...)` with no `_1_1` sub-unit. KiCad and kicad-cli
+tolerate this, but kicad-skip's parser crashes on it, taking down every
+skip-based tool for the whole sheet (including sheets that merely embed a
+snapshot of such a symbol in their own `lib_symbols`).
+
+Schematic load failures now raise `SchematicLoadError` and all schematic
+tools return a structured error naming the offending symbols:
+
+```json
+{
+  "success": false,
+  "error": "schematic_load_failed",
+  "flatSymbols": ["LIB:PART"],
+  "message": "Schematic load failed for ...: embedded flat lib symbols [...]"
+}
+```
+
+**Workaround:** run the `repair_flat_symbols` tool (if available) or wrap
+each flat symbol's pins/graphics in a `(symbol "NAME_1_1" ...)` sub-unit.
+Note that tools which previously returned partial/empty results on
+unparseable schematics (e.g. `find_orphaned_wires`, hierarchical net
+traversal, `sync_schematic_to_board`) now return errors instead.
+
+---
+
+## Recently Fixed (v2.7.0)
+
+### Python Bridge Delivered Responses to the Wrong Caller (Fixed v2.7.0, #373)
+
+- After a tool call timed out, the late reply resolved the _next_ request, and
+  every response after that was off by one. Requests now carry an ID that
+  Python echoes back, and stale responses are discarded.
+
+### Clients Stalled for up to Two Minutes at Startup (Fixed v2.7.0, #377)
+
+- The MCP transport used to connect only after Python and pcbnew had finished
+  initialising. It now connects first, so `initialize` and `tools/list` answer
+  immediately and tool calls queue behind a ready gate.
+
+### `add_symbol_property` Corrupted `.kicad_sym` Libraries (Fixed v2.7.0)
+
+- Every call dropped a closing paren, and a new property could land inside the
+  last unit or outside the symbol entirely. The write path now matches parens
+  with string awareness, verifies the result before writing, and writes
+  atomically.
+
+### Concurrent Servers Fought Over One Log File (Fixed v2.7.0, #373)
+
+- Log files are now per-process, named `kicad_interface-<pid>.log`. Old logs
+  are swept after seven days.
 
 ---
 
@@ -134,7 +198,7 @@ AttributeError: 'BOARD' object has no attribute 'LT_USER'
 
 If you encounter an issue not listed here:
 
-1. **Check MCP logs:** `~/.kicad-mcp/logs/kicad_interface.log`
+1. **Check MCP logs:** `~/.kicad-mcp/logs/kicad_interface-<pid>.log` (one file per server process)
 2. **Enable developer mode:** Set `KICAD_MCP_DEV=1` to capture session logs
 3. **Check KiCAD version:** `python3 -c "import pcbnew; print(pcbnew.GetBuildVersion())"` (must be 9.0+)
 4. **Try the operation in KiCAD directly** -- is it a KiCAD issue?
@@ -187,5 +251,5 @@ python3 python/utils/platform_helper.py
 **Need Help?**
 
 - Check [IPC_BACKEND_STATUS.md](IPC_BACKEND_STATUS.md) for IPC details
-- Check logs: `~/.kicad-mcp/logs/kicad_interface.log`
+- Check logs: `~/.kicad-mcp/logs/kicad_interface-<pid>.log` (one file per server process)
 - Open an issue on GitHub

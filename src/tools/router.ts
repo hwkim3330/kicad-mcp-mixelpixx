@@ -1,7 +1,16 @@
 /**
- * Router Tools for KiCAD MCP Server
+ * Tool discovery for the KiCAD MCP Server.
  *
- * Provides discovery and execution of routed tools
+ * These three tools browse and search the registry in `registry.ts`. They do
+ * not execute anything on the caller's behalf. Every tool is registered
+ * directly with the server and is callable by name, so discovery is a search
+ * catalogue rather than a gate.
+ *
+ * The original gated design routed calls through a single `execute_tool`. It
+ * was disabled in 3d9497e because indirect execution made the model
+ * hallucinate tool schemas, and `execute_tool` was deleted in 963a39c. Response
+ * text here must therefore never tell a client to call `execute_tool`; see
+ * tests-ts/no-stale-tool-references.test.ts, which enforces that.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -13,14 +22,20 @@ import {
   searchTools as registrySearchTools,
   getRegistryStats,
 } from "./registry.js";
+import type { ToolboxManager } from "./toolboxes.js";
 
 // Command function type for KiCAD script calls
 type CommandFunction = (command: string, params: Record<string, unknown>) => Promise<any>;
 
 /**
- * Register all router tools with the MCP server
+ * Register all router tools with the MCP server. With `toolboxes` in toolbox
+ * mode, search_tools also says whether each match's toolbox is open.
  */
-export function registerRouterTools(server: McpServer, _callKicadScript: CommandFunction): void {
+export function registerRouterTools(
+  server: McpServer,
+  _callKicadScript: CommandFunction,
+  toolboxes?: ToolboxManager,
+): void {
   logger.info("Registering router tools");
 
   // ============================================================================
@@ -28,7 +43,7 @@ export function registerRouterTools(server: McpServer, _callKicadScript: Command
   // ============================================================================
   server.tool(
     "list_tool_categories",
-    "List all available KiCAD tool categories with their descriptions and tool counts. Use this to discover which tools are available via the router.",
+    "List all available KiCAD tool categories with their descriptions and tool counts. Use this to discover which tools exist; every tool can then be called directly by name.",
     {
       // No parameters
     },
@@ -42,7 +57,7 @@ export function registerRouterTools(server: McpServer, _callKicadScript: Command
         total_categories: stats.total_categories,
         total_routed_tools: stats.total_routed_tools,
         total_direct_tools: stats.total_direct_tools,
-        note: "Use get_category_tools to see tools in each category. Direct tools are always available.",
+        note: "Use get_category_tools to see the tools in each category. Every tool is registered directly on the server and is called by name.",
         categories: categories.map((c) => ({
           name: c.name,
           description: c.description,
@@ -102,9 +117,9 @@ export function registerRouterTools(server: McpServer, _callKicadScript: Command
         tool_count: categoryData.tools.length,
         tools: categoryData.tools.map((toolName) => ({
           name: toolName,
-          description: `Use execute_tool with tool_name="${toolName}" to run this tool`,
+          description: `Call ${toolName} directly by name.`,
         })),
-        note: "Use execute_tool to run any of these tools with appropriate parameters",
+        note: "Call any of these tools directly by name with its own parameters.",
       };
 
       return {
@@ -130,16 +145,29 @@ export function registerRouterTools(server: McpServer, _callKicadScript: Command
     async ({ query }) => {
       logger.debug(`Searching tools for: ${query}`);
 
-      const matches = registrySearchTools(query);
+      const toolboxMode = toolboxes?.toolboxMode === true;
+      const matches = registrySearchTools(query).map((match) =>
+        toolboxMode && getCategory(match.category)
+          ? { ...match, toolbox_open: toolboxes!.isOpen(match.category) }
+          : match,
+      );
+      const inClosedToolbox = matches.some((m) => "toolbox_open" in m && !m.toolbox_open);
+
+      let note = "Call a matching tool directly by name with its own parameters.";
+      if (matches.length === 0) {
+        note = toolboxMode
+          ? "No tools found matching your query. Try list_toolboxes to browse the toolboxes."
+          : "No tools found matching your query. Try list_tool_categories to browse all categories.";
+      } else if (inClosedToolbox) {
+        note +=
+          " A match whose toolbox_open is false is not in your tool list yet: open its toolbox (the category) with open_toolbox first.";
+      }
 
       const result = {
         query: query,
         count: matches.length,
         matches: matches,
-        note:
-          matches.length > 0
-            ? "Use execute_tool with the tool name to run it"
-            : "No tools found matching your query. Try list_tool_categories to browse all categories.",
+        note,
       };
 
       return {

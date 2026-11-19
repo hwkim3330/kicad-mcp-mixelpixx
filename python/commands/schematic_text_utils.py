@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from utils.sexpr_format import QUOTED_VALUE, match_paren, unescape_sexpr_string
+
 _KICAD_INTERNAL_PROPS = frozenset(
     {"ki_keywords", "ki_description", "ki_fp_filters", "ki_locked", "ki_model"}
 )
@@ -31,20 +33,22 @@ _PAPER_DIMS = {
 
 
 def _find_matching_paren(s: str, start: int) -> int:
-    """Return index of the ')' matching the '(' at position *start*, or -1."""
-    depth = 0
-    for i in range(start, len(s)):
-        if s[i] == "(":
-            depth += 1
-        elif s[i] == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-    return -1
+    """Return index of the ')' matching the '(' at position *start*, or -1.
+
+    Parens inside quoted strings are text: KiCad writes pin names such as
+    "PA13(JTMS" raw.
+    """
+    return match_paren(s, start)
 
 
-def _find_placed_symbol_block(content: str, reference: str) -> Tuple[Optional[str], int, int]:
-    """Find the placed symbol block for *reference*. Returns (block, start, end) or (None, -1, -1)."""
+def _find_placed_symbol_block(
+    content: str, reference: str, unit: Optional[int] = None
+) -> Tuple[Optional[str], int, int]:
+    """Find the placed symbol block for *reference*. Returns (block, start, end) or (None, -1, -1).
+
+    ``unit`` picks one placement of a multi-unit part, whose units all carry the
+    same reference; without it the first block in file order wins.
+    """
     lib_sym_pos = content.find("(lib_symbols")
     lib_sym_end = _find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
     pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
@@ -63,7 +67,11 @@ def _find_placed_symbol_block(content: str, reference: str) -> Tuple[Optional[st
             continue
         block_text = content[pos : end + 1]
         if re.search(r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"', block_text):
-            return block_text, pos, end
+            if unit is None:
+                return block_text, pos, end
+            um = re.search(r"\(unit\s+(\d+)\)", block_text)
+            if um and int(um.group(1)) == int(unit):
+                return block_text, pos, end
         search_start = end + 1
     return None, -1, -1
 
@@ -71,8 +79,9 @@ def _find_placed_symbol_block(content: str, reference: str) -> Tuple[Optional[st
 def _extract_component_properties(block_text: str, exclude_internal: bool = True) -> Dict[str, str]:
     """Extract {name: value} for all (property "name" "value" ...) entries in a symbol block."""
     props = {}
-    for m in re.finditer(r'\(property\s+"([^"]*)"\s+"([^"]*)"', block_text):
-        name, value = m.group(1), m.group(2)
+    for m in re.finditer(r"\(property\s+" + QUOTED_VALUE + r"\s+" + QUOTED_VALUE, block_text):
+        name = unescape_sexpr_string(m.group(1))
+        value = unescape_sexpr_string(m.group(2))
         if exclude_internal and name in _KICAD_INTERNAL_PROPS:
             continue
         props[name] = value
@@ -169,11 +178,29 @@ def _find_project_root(start_dir: Path) -> Path:
     return start_dir
 
 
+# Outward direction of a pin by its label orientation, in sheet coordinates (y down).
+_OUTWARD = {0: (1, 0), 90: (0, -1), 180: (-1, 0), 270: (0, 1)}
+
+
+def _straight_ahead(position, orientation, target, tol=0.01):
+    """True when *target* lies on the pin's outward axis, in front of the pin."""
+    d = _OUTWARD.get(int(round(orientation / 90) * 90) % 360)
+    if d is None:
+        return False
+    dx, dy = float(target[0]) - float(position[0]), float(target[1]) - float(position[1])
+    along = dx * d[0] + dy * d[1]
+    across = abs(dx * d[1] - dy * d[0])
+    return along > tol and across <= tol
+
+
 def _find_facing_label(sch_path, net_name, position, orientation, proximity_mm=14.0):
     """Return [x, y] of an existing label for *net_name* that faces *position*, else None.
 
-    "Facing" = within proximity_mm and oriented 180° opposite, so a single wire between
-    the two pins is cleaner than two overlapping labels.
+    "Facing" = within proximity_mm, oriented 180° opposite, and straight out in front
+    of the pin on its own axis, so a single wire between the two pins is cleaner than
+    two overlapping labels. A label off that axis is not facing: joining it would draw
+    a diagonal wire, which no schematic is drawn with (and a label behind the pin would
+    send the wire back across the symbol body).
     """
     try:
         content = sch_path.read_text(encoding="utf-8")
@@ -186,7 +213,7 @@ def _find_facing_label(sch_path, net_name, position, orientation, proximity_mm=1
             lx, ly, la = float(m.group(2)), float(m.group(3)), float(m.group(4))
             if math.hypot(lx - px, ly - py) > proximity_mm:
                 continue
-            if int(round(la)) % 360 == facing:
+            if int(round(la)) % 360 == facing and _straight_ahead(position, orientation, (lx, ly)):
                 return [lx, ly]
     except Exception:
         pass

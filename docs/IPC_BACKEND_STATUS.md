@@ -42,6 +42,7 @@ The following MCP commands have IPC handlers:
 | `query_traces`             | `_ipc_query_traces`             | Implemented          |
 | `get_nets_list`            | `_ipc_get_nets_list`            | Implemented          |
 | `add_copper_pour`          | `_ipc_add_copper_pour`          | Implemented          |
+| `add_copper_keepout`       | `_ipc_add_copper_keepout`       | IPC only             |
 | `refill_zones`             | `_ipc_refill_zones`             | Implemented          |
 | `add_text`                 | `_ipc_add_text`                 | Implemented          |
 | `add_board_text`           | `_ipc_add_text`                 | Implemented          |
@@ -158,7 +159,7 @@ Once a project is loaded, its entire lifecycle is **pinned to one backend**
 until it is reopened:
 
 - `open_project` pins the session to **ipc** only when the live KiCad GUI
-  provably has the *same* `.kicad_pcb` open (path comparison via the IPC
+  provably has the _same_ `.kicad_pcb` open (path comparison via the IPC
   open-documents list). Otherwise — including every `create_project`, since
   the GUI cannot have a brand-new board open — the session pins to **swig**.
 - A **swig-pinned session never silently upgrades to IPC**, even if KiCad
@@ -278,7 +279,6 @@ python/
 ## Related Documentation
 
 - [ROADMAP.md](./ROADMAP.md) - Project roadmap
-- [IPC_API_MIGRATION_PLAN.md](./IPC_API_MIGRATION_PLAN.md) - Migration details
 - [REALTIME_WORKFLOW.md](./REALTIME_WORKFLOW.md) - Collaboration workflows
 - [kicad-python docs](https://docs.kicad.org/kicad-python-main/) - Official API docs
 

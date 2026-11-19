@@ -120,14 +120,16 @@ Add a via to the PCB.
 | --------- | ------ | -------- | ----------------------------------------- |
 | position  | object | Yes      | Via position with x, y, and optional unit |
 | net       | string | Yes      | Net name                                  |
-| viaType   | string | No       | Via type: "through", "blind", or "buried" |
+| viaType   | string | No       | Via type: only "through" is supported     |
 
 **Usage Notes:**
 
-- Through vias connect all layers (default)
-- Blind vias connect an outer layer to one or more inner layers
-- Buried vias connect two or more inner layers without reaching outer layers
-- Position coordinates use mm by default
+- Through vias connect all layers (default). Blind, buried and micro vias are
+  refused, because neither schema has parameters for their layer pair
+- Position coordinates use mm when `unit` is omitted
+- A net that does not exist on the board is an error, not a via without a net
+- JSON-RPC callers can send `x`, `y` (mm), `diameter`, `drill` and `netName`
+  instead
 
 **Example:**
 
@@ -145,33 +147,37 @@ Add a via to the PCB.
 
 ### route_differential_pair
 
-Route a differential pair between two sets of points.
+Route a differential pair as two parallel straight segments.
 
 **Parameters:**
 
-| Parameter   | Type   | Required | Description                                |
-| ----------- | ------ | -------- | ------------------------------------------ |
-| positivePad | object | Yes      | Positive pad with reference and pad number |
-| negativePad | object | Yes      | Negative pad with reference and pad number |
-| layer       | string | Yes      | PCB layer                                  |
-| width       | number | Yes      | Trace width in mm                          |
-| gap         | number | Yes      | Gap between traces in mm                   |
-| positiveNet | string | Yes      | Positive net name                          |
-| negativeNet | string | Yes      | Negative net name                          |
+| Parameter   | Type   | Required | Description                                     |
+| ----------- | ------ | -------- | ----------------------------------------------- |
+| startPos    | object | Yes      | Start of the pair's centreline: `{x, y, unit?}` |
+| endPos      | object | Yes      | End of the pair's centreline: `{x, y, unit?}`   |
+| layer       | string | Yes      | PCB layer                                       |
+| width       | number | Yes      | Trace width in mm                               |
+| gap         | number | Yes      | Edge-to-edge gap between the two traces in mm   |
+| positiveNet | string | Yes      | Positive net name                               |
+| negativeNet | string | Yes      | Negative net name                               |
 
 **Usage Notes:**
 
 - Used for high-speed signals like USB, Ethernet, HDMI, etc.
 - Maintains controlled impedance through consistent trace width and gap
-- Both traces are routed in parallel with specified separation
-- Pad object format: `{"reference": "U1", "pad": "1"}`
+- Each trace's centreline is offset (gap + width) / 2 from the path, so the
+  copper between them is exactly `gap`
+- Looking from `startPos` to `endPos` on the board (y down), the positive trace
+  runs on the right and the negative on the left
+- The segments are straight and do not end on pads; join them to the pads with
+  `route_trace` or `route_pad_to_pad`
 
 **Example:**
 
 ```json
 {
-  "positivePad": { "reference": "J1", "pad": "2" },
-  "negativePad": { "reference": "J1", "pad": "3" },
+  "startPos": { "x": 20, "y": 30, "unit": "mm" },
+  "endPos": { "x": 45, "y": 30, "unit": "mm" },
   "layer": "F.Cu",
   "width": 0.2,
   "gap": 0.2,
@@ -224,17 +230,22 @@ Get a list of all nets in the PCB with optional statistics.
 
 **Parameters:**
 
-| Parameter    | Type    | Required | Description                                          |
-| ------------ | ------- | -------- | ---------------------------------------------------- |
-| includeStats | boolean | No       | Include statistics (track count, total length, etc.) |
-| unit         | string  | No       | Unit for length measurements: "mm" or "inch"         |
+| Parameter    | Type    | Required | Description                                               |
+| ------------ | ------- | -------- | --------------------------------------------------------- |
+| includeStats | boolean | No       | Add per-net track count, total track length and via count |
+| unit         | string  | No       | Unit for track lengths: "mm" (default), "mil" or "inch"   |
 
 **Usage Notes:**
 
 - Returns all nets present in the board
-- Statistics include track count, via count, and total trace length
+- With `includeStats`, each net gets
+  `"stats": {"trackCount": 2, "trackLength": 25.4, "viaCount": 1}` and the
+  response gets `"unit"`. Nets with no copper report zeros.
+- `trackLength` sums straight tracks and arcs (arc length). On the IPC
+  backend only straight segments are counted, because the IPC backend's
+  `get_tracks()` returns straight segments only.
+- An unsupported `unit` is an error rather than silently treated as mm
 - Useful for verifying net connectivity and routing completeness
-- Length measurements default to mm
 
 **Example:**
 
@@ -379,7 +390,7 @@ Modify an existing trace (change width, layer, or net).
 
 ---
 
-## Copper Zones (2 tools)
+## Copper Zones (3 tools)
 
 ### add_copper_pour
 
@@ -417,6 +428,30 @@ Add a copper pour (ground/power plane) to the PCB.
   ]
 }
 ```
+
+---
+
+### add_copper_keepout
+
+Add a rule area that keeps copper zone fills out of a polygon. Tracks, vias, pads and footprints remain allowed, so this can clear the planes beneath a PCB antenna without blocking its traces.
+
+The named board must be open in KiCad with IPC enabled. The tool validates every requested copper layer against that board, creates the rule area in one undo transaction, reads back its ID, layers, outline and flags, then refills zones. Save the board separately. An `applied_not_refilled` or `applied_readback_mismatch` result means the rule area was created but needs inspection before relying on it.
+
+```json
+{
+  "boardPath": "/path/to/board.kicad_pcb",
+  "name": "Antenna plane clearance",
+  "layers": ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"],
+  "points": [
+    { "x": 10, "y": 10 },
+    { "x": 50, "y": 10 },
+    { "x": 50, "y": 40 },
+    { "x": 10, "y": 40 }
+  ]
+}
+```
+
+The tool does not validate a Freerouting export/import round trip; check that separately if the board will be autorouted.
 
 ---
 
@@ -490,8 +525,8 @@ For high-speed differential signals like USB D+ and D-:
 {
   "tool": "route_differential_pair",
   "params": {
-    "positivePad": {"reference": "U1", "pad": "14"},
-    "negativePad": {"reference": "U1", "pad": "15"},
+    "startPos": {"x": 20, "y": 30, "unit": "mm"},
+    "endPos": {"x": 45, "y": 30, "unit": "mm"},
     "layer": "F.Cu",
     "width": 0.2,
     "gap": 0.2,
@@ -553,5 +588,5 @@ Note: Use the IPC backend (keep KiCAD open) when using refill_zones to avoid pot
 
 ## Source Files
 
-- **TypeScript Tool Definitions**: `/home/chris/MCP/KiCAD-MCP-Server/src/tools/routing.ts`
-- **Python Implementation**: `/home/chris/MCP/KiCAD-MCP-Server/python/commands/routing.py`
+- **TypeScript Tool Definitions**: `src/tools/routing.ts`
+- **Python Implementation**: `python/commands/routing.py`

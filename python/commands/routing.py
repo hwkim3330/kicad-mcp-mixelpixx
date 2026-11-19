@@ -6,13 +6,111 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pcbnew
+from utils.board_items import delete_board_item
+from utils.project_netclasses import load_project_net_classes, netclass_pattern_for_net
 
 logger = logging.getLogger("kicad_interface")
+
+
+# --- Length units for query results (#407) --------------------------------
+#
+# Millimetres per unit. Shared by the SWIG and IPC handlers of get_nets_list so
+# both report statistics the same way.
+LENGTH_UNITS_MM = {"mm": 1.0, "mil": 0.0254, "inch": 25.4}
+
+
+def length_unit_error(unit: Any) -> Optional[Dict[str, Any]]:
+    """Error payload for an unsupported unit, or None when the unit is valid."""
+    if unit in LENGTH_UNITS_MM:
+        return None
+    return {
+        "success": False,
+        "message": "Invalid unit",
+        "errorDetails": f"unit must be one of {sorted(LENGTH_UNITS_MM)}, got {unit!r}",
+    }
+
+
+def net_stats(
+    tracks: List[Tuple[str, float]], vias: List[str], unit: str = "mm"
+) -> Dict[str, Dict[str, Any]]:
+    """Per-net track count, total track length and via count.
+
+    ``tracks`` holds ``(net name, length in mm)`` pairs and ``vias`` holds net
+    names. Lengths are returned in ``unit``.
+    """
+    stats: Dict[str, Dict[str, Any]] = {}
+
+    def entry(net: str) -> Dict[str, Any]:
+        return stats.setdefault(net, {"trackCount": 0, "trackLength": 0.0, "viaCount": 0})
+
+    for net, length_mm in tracks:
+        item = entry(net)
+        item["trackCount"] += 1
+        item["trackLength"] += length_mm
+    for net in vias:
+        entry(net)["viaCount"] += 1
+    scale = LENGTH_UNITS_MM[unit]
+    for item in stats.values():
+        item["trackLength"] = round(item["trackLength"] / scale, 6)
+    return stats
+
+
+# --- add_via parameters (#407) ---------------------------------------------
+#
+# The zod schema sends ``position: {x, y, unit?}``, ``net`` and ``viaType``;
+# the JSON-RPC schema sends ``x`` and ``y`` in mm, ``diameter``, ``drill`` and
+# ``netName``. ``size`` is the older name for the diameter. Shared by the SWIG
+# and IPC handlers so both accept the same calls.
+
+
+def via_request(
+    params: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Normalised add_via parameters, or an error payload.
+
+    Returns ``(request, None)`` with the position in mm, or ``(None, error)``.
+    ``diameter_mm`` and ``drill_mm`` are None when not given.
+    """
+    position = params.get("position")
+    if isinstance(position, dict):
+        x, y, unit = position.get("x"), position.get("y"), position.get("unit", "mm")
+    else:
+        x, y, unit = params.get("x"), params.get("y"), "mm"
+    if x is None or y is None:
+        return None, {
+            "success": False,
+            "message": "Missing position",
+            "errorDetails": "position {x, y, unit?} (or x and y in mm) is required",
+        }
+    unit_error = length_unit_error(unit)
+    if unit_error:
+        return None, unit_error
+    via_type = params.get("viaType", "through")
+    if via_type != "through":
+        # Blind, buried and micro vias need a layer pair that neither schema
+        # declares; refuse them rather than silently adding a through via.
+        return None, {
+            "success": False,
+            "message": "Unsupported via type",
+            "errorDetails": f"only through vias can be added, got viaType {via_type!r}",
+        }
+    scale = LENGTH_UNITS_MM[unit]
+    return {
+        "x": x,
+        "y": y,
+        "unit": unit,
+        "x_mm": x * scale,
+        "y_mm": y * scale,
+        "diameter_mm": params.get("diameter", params.get("size")),
+        "drill_mm": params.get("drill"),
+        "net": params.get("net") or params.get("netName"),
+    }, None
 
 
 # --- Net class project-file persistence (KiCad 7+) ------------------------
@@ -137,6 +235,353 @@ def persist_netclass_to_project(
         }
 
 
+def apply_net_assignment_to_project_settings(
+    data: Dict[str, Any], net_name: str, class_name: str
+) -> Dict[str, Any]:
+    """Insert or update a net's netclass assignment in a parsed ``.kicad_pro`` dict.
+    Pure: mutates and returns ``data``; performs no I/O.
+
+    Explicit per-net assignments live in ``net_settings.netclass_assignments``
+    on KiCad 9+ (net name -> list of class names). A net keeps only the most
+    recent assignment here — composite/multi-class membership is not modeled.
+
+    Note the key is present-but-null in a freshly written project: KiCad emits
+    ``"netclass_assignments": null`` when there are no assignments (see
+    ``utils/kicad_project.py``, captured from real pcbnew output). ``setdefault``
+    would hand back that ``None`` rather than replacing it, so the key has to be
+    normalized to a dict explicitly — otherwise assignment raises ``TypeError``
+    on every real project file.
+    """
+    net_settings = data.setdefault("net_settings", {})
+    if not isinstance(net_settings, dict):
+        net_settings = {}
+        data["net_settings"] = net_settings
+    assignments = net_settings.get("netclass_assignments")
+    if not isinstance(assignments, dict):
+        assignments = {}
+        net_settings["netclass_assignments"] = assignments
+    assignments[net_name] = [class_name]
+    # The durable record is an exact-name entry in netclass_patterns. KiCad treats
+    # netclass_assignments as DERIVED from the schematic's net-class directives and
+    # rewrites it on Update PCB from Schematic: on a schematic with no directives a
+    # sync (sync_schematic_to_board) leaves it empty and every assignment made here
+    # is silently lost. The user-defined patterns survive a sync. Seen on a real
+    # 6-layer HV board: 21 voltage-class assignments dropped, every clearance rule
+    # keyed on those classes stopped matching, and DRC still passed.
+    #
+    # The pattern is the name made literal for KiCad (see netclass_pattern_for_net): KiCad reads
+    # a pattern as a regular expression, so the raw name would also capture other
+    # nets. A re-assignment updates the net's entry in place; an entry holding the
+    # raw name (what an earlier build of this code wrote) is the same net's record
+    # and is rewritten to the escaped form rather than left beside it.
+    pattern = netclass_pattern_for_net(net_name)
+    patterns = net_settings.get("netclass_patterns")
+    if not isinstance(patterns, list):
+        patterns = []
+        net_settings["netclass_patterns"] = patterns
+    for entry in patterns:
+        if isinstance(entry, dict) and entry.get("pattern") in (
+            pattern,
+            net_name,
+            re.escape(net_name),  # what this tool wrote before the KiCad-literal form
+        ):
+            entry["pattern"] = pattern
+            entry["netclass"] = class_name
+            break
+    else:
+        patterns.append({"netclass": class_name, "pattern": pattern})
+    return data
+
+
+def _project_file_for(board: Any) -> Optional[str]:
+    """The ``.kicad_pro`` next to *board*'s file, or None."""
+    try:
+        board_path = board.GetFileName()
+    except Exception:
+        return None
+    if board_path and board_path.endswith(".kicad_pcb"):
+        return str(Path(board_path).with_suffix(".kicad_pro"))
+    return None
+
+
+def set_net_class_in_memory(net: Any, netclass: Any) -> None:
+    """Put *net* in *netclass* on the live board.
+
+    KiCad 8, 9 and 10 call the setter ``SetNetClass``; ``SetClass`` is the
+    KiCad 6/7 name. Calling ``SetClass`` on a current build raises
+    AttributeError, which used to abort net-class work after the class itself
+    had been set up.
+    """
+    setter = getattr(net, "SetNetClass", None) or getattr(net, "SetClass", None)
+    if setter is None:
+        raise AttributeError("NETINFO_ITEM has neither SetNetClass nor SetClass")
+    setter(netclass)
+
+
+def _board_net_settings(board: Any) -> Any:
+    """The board's in-memory NET_SETTINGS (KiCad 8+), or None."""
+    try:
+        return board.GetDesignSettings().m_NetSettings
+    except Exception:
+        return None
+
+
+def register_netclass_in_project_settings(board: Any, name: str, netclass: Any) -> Optional[str]:
+    """Add *netclass* to the board's in-memory project net settings.
+
+    On KiCad 9, ``pcbnew.SaveBoard`` rewrites the ``.kicad_pro`` from these
+    in-memory settings, so a class written only to the file is erased by the
+    next board save. KiCad 10 leaves the file alone, which is why the file write
+    stays. Returns a warning, or None.
+    """
+    settings = _board_net_settings(board)
+    if settings is None or not hasattr(settings, "SetNetclass"):
+        return None
+    try:
+        settings.SetNetclass(name, netclass)
+    except Exception as exc:
+        return f"in-memory project net class registration failed: {exc}"
+    return None
+
+
+def _project_file_patterns(pro_path: Optional[str]) -> Optional[List[Tuple[str, str]]]:
+    """The ``netclass_patterns`` entries the project file holds, as
+    ``(pattern, class)``. None when there is no readable project file.
+
+    ``netclass_assignments`` is left out on purpose. KiCad derives those
+    entries from the schematic's net-class directives, and on KiCad 9 the next
+    ``SaveBoard`` writes every in-memory pattern back to ``netclass_patterns``:
+    pushed in as patterns, a directive-derived membership became a permanent
+    pattern that outlived its directive (checked on 9.0.9; 10.0.8 leaves the
+    file alone on save)."""
+    try:
+        loaded = load_project_net_classes(pro_path)
+    except ValueError:
+        return None
+    if loaded is None:
+        return None
+    patterns: List[Tuple[str, str]] = []
+    for pattern, class_name in loaded["patterns"]:
+        if (pattern, class_name) not in patterns:
+            patterns.append((pattern, class_name))
+    return patterns
+
+
+# Worded so it holds whether or not the project-file write succeeded: the callers add it
+# in both cases, and their reply reports the file write separately.
+KICAD8_MEMBERSHIP_WARNING = (
+    "KiCad 8: the next board save rewrites the project file from memory, which this server "
+    "cannot reach on KiCad 8, and drops this net class membership. Assign the class in "
+    "KiCad's Board Setup, or use KiCad 9 or later."
+)
+
+
+def register_membership_in_project_settings(
+    board: Any, net_name: str, class_name: str, pro_path: Optional[str] = None
+) -> Optional[str]:
+    """``register_memberships_in_project_settings`` for one net."""
+    return register_memberships_in_project_settings(board, [net_name], class_name, pro_path)
+
+
+def register_memberships_in_project_settings(
+    board: Any, net_names: List[str], class_name: str, pro_path: Optional[str] = None
+) -> Optional[str]:
+    """Record that each of *net_names* belongs to *class_name* in the in-memory
+    net settings. Call it after the project file has been written.
+
+    Same reason as ``register_netclass_in_project_settings``. Python can't call
+    the label-assignment setter (SWIG doesn't wrap its ``std::set`` argument),
+    so membership goes in as a pattern assignment on the escaped net name
+    (``netclass_pattern_for_net``: KiCad reads a pattern as a regular
+    expression, so a raw ``D+`` would also claim ``D`` and ``DD``).
+
+    ``SetNetclassPatternAssignment`` appends, so assigning a net to A and then
+    to B would leave it in the composite class ``A,B`` with A's clearance
+    winning; on KiCad 9 the next save writes both into the project. Python
+    can't read the list back either (``GetNetclassPatternAssignments`` is an
+    opaque SWIG object), so the list is rebuilt from the project file, which
+    the writer keeps at one entry per net: cleared, then every pattern the
+    file holds is set again. Without a project file the nets' patterns are
+    appended. A label assignment loaded from the project for the net (the
+    old class, from a schematic directive) is cleared first. Returns a
+    warning, or None.
+    """
+    settings = _board_net_settings(board)
+    if settings is None:
+        return None
+    if not hasattr(settings, "SetNetclassPatternAssignment"):
+        # KiCad 8: no pattern API from Python, and SaveBoard rewrites the .kicad_pro from the
+        # in-memory NET_SETTINGS, so the membership just written to the file does not survive it.
+        return KICAD8_MEMBERSHIP_WARNING
+
+    try:
+        if hasattr(settings, "ClearNetclassLabelAssignment"):
+            for net_name in net_names:
+                settings.ClearNetclassLabelAssignment(net_name)
+        wanted = [(netclass_pattern_for_net(net_name), class_name) for net_name in net_names]
+        file_patterns = _project_file_patterns(pro_path)
+        if file_patterns is not None and hasattr(settings, "ClearNetclassPatternAssignments"):
+            settings.ClearNetclassPatternAssignments()
+            patterns = file_patterns
+            for entry in wanted:
+                if entry not in patterns:
+                    patterns.append(entry)
+        else:
+            patterns = wanted
+        for pattern, pattern_class in patterns:
+            settings.SetNetclassPatternAssignment(pattern, pattern_class)
+        if hasattr(settings, "ClearAllCaches"):
+            settings.ClearAllCaches()
+    except Exception as exc:
+        return f"in-memory project net class assignment failed: {exc}"
+    return None
+
+
+def persist_net_assignment_to_project(
+    pro_path: Optional[str], net_name: str, class_name: str
+) -> Dict[str, Any]:
+    """Read/modify/write ``pro_path`` so a net's class assignment survives a
+    reload (KiCad 7+ keeps net-to-class membership in the project file, not
+    the board).
+
+    Returns ``{"persisted": bool, "projectFile"?: str, "warning"?: str}``. Never
+    raises: a persistence failure is reported, not fatal, so the in-memory
+    assignment still stands. The write is atomic (temp file + ``os.replace``)
+    so a crash mid-write cannot corrupt the project file.
+    """
+    return persist_net_assignments_to_project(pro_path, [net_name], class_name)
+
+
+def persist_net_assignments_to_project(
+    pro_path: Optional[str], net_names: List[str], class_name: str
+) -> Dict[str, Any]:
+    """``persist_net_assignment_to_project`` for several nets in one write."""
+    if not pro_path or not os.path.exists(pro_path):
+        return {
+            "persisted": False,
+            "warning": "no .kicad_pro project file found; net class assignment set "
+            "in memory only and will not persist across a reload",
+        }
+    try:
+        with open(pro_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        for net_name in net_names:
+            apply_net_assignment_to_project_settings(data, net_name, class_name)
+
+        directory = os.path.dirname(pro_path) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".netassign-", suffix=".kicad_pro")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_path, pro_path)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+        return {"persisted": True, "projectFile": pro_path}
+    except Exception as exc:  # report, never fail the command on a persistence error
+        return {
+            "persisted": False,
+            "warning": f"could not persist net class assignment to {pro_path}: {exc}",
+        }
+
+
+# --- Net color project-file persistence (KiCad 7+) -------------------------
+#
+# An individual net's display color (the "Net colors" panel in the PCB
+# editor) lives only in ``<project>.kicad_pro`` -> ``net_settings.net_colors``,
+# a flat ``{net_name: "rgb(r, g, b)"}`` map. Unlike net class membership,
+# there is no SWIG mirror to keep in sync: ``NETINFO_ITEM`` (pcbnew.py) has no
+# color getter/setter at all, so this is pure JSON I/O, same persistence
+# shape as ``apply_net_assignment_to_project_settings`` above. A net with no
+# entry in the map simply uses its automatic/class color, which is why
+# clearing an override means deleting the key rather than writing a sentinel.
+
+_HEX_COLOR_RE = re.compile(r"^#?([0-9A-Fa-f]{6})$")
+
+
+def _hex_to_kicad_rgb(color: str) -> str:
+    """Convert a ``#RRGGBB`` / ``RRGGBB`` hex string to KiCad's
+    ``"rgb(r, g, b)"`` net_colors format. Raises ValueError on anything else.
+    """
+    match = _HEX_COLOR_RE.match(color.strip())
+    if not match:
+        raise ValueError(f"'{color}' is not a valid hex color (expected '#RRGGBB')")
+    hex_digits = match.group(1)
+    r = int(hex_digits[0:2], 16)
+    g = int(hex_digits[2:4], 16)
+    b = int(hex_digits[4:6], 16)
+    return f"rgb({r}, {g}, {b})"
+
+
+def apply_net_color_to_project_settings(
+    data: Dict[str, Any], net_name: str, kicad_rgb: Optional[str]
+) -> Dict[str, Any]:
+    """Insert, update, or clear a net's color override in a parsed
+    ``.kicad_pro`` dict. Pure: mutates and returns ``data``; performs no I/O.
+
+    ``kicad_rgb=None`` clears the override (removes the key), reverting the
+    net to its automatic/class color — mirroring the native "Clear color"
+    action. Same present-but-null defensiveness as
+    ``apply_net_assignment_to_project_settings``: a fresh project can have
+    ``"net_colors": null``.
+    """
+    net_settings = data.setdefault("net_settings", {})
+    if not isinstance(net_settings, dict):
+        net_settings = {}
+        data["net_settings"] = net_settings
+    net_colors = net_settings.get("net_colors")
+    if not isinstance(net_colors, dict):
+        net_colors = {}
+        net_settings["net_colors"] = net_colors
+    if kicad_rgb is None:
+        net_colors.pop(net_name, None)
+    else:
+        net_colors[net_name] = kicad_rgb
+    return data
+
+
+def persist_net_color_to_project(
+    pro_path: Optional[str], net_name: str, kicad_rgb: Optional[str]
+) -> Dict[str, Any]:
+    """Read/modify/write ``pro_path`` so a net's color override survives a
+    reload. Returns ``{"persisted": bool, "projectFile"?: str, "warning"?: str}``.
+    Never raises. The write is atomic (temp file + ``os.replace``).
+    """
+    if not pro_path or not os.path.exists(pro_path):
+        return {
+            "persisted": False,
+            "warning": "no .kicad_pro project file found; net color not persisted",
+        }
+    try:
+        with open(pro_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        apply_net_color_to_project_settings(data, net_name, kicad_rgb)
+
+        directory = os.path.dirname(pro_path) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".netcolor-", suffix=".kicad_pro")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_path, pro_path)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+        return {"persisted": True, "projectFile": pro_path}
+    except Exception as exc:  # report, never fail the command on a persistence error
+        return {
+            "persisted": False,
+            "warning": f"could not persist net color to {pro_path}: {exc}",
+        }
+
+
 class RoutingCommands:
     """Handles routing-related KiCAD operations"""
 
@@ -155,7 +600,9 @@ class RoutingCommands:
                 }
 
             name = params.get("name")
-            net_class = params.get("class")
+            # The zod schema declares `netClass`; `class` is the historical key the
+            # JSON-RPC schema used, kept so existing callers keep working.
+            net_class = params.get("netClass") or params.get("class")
 
             if not name:
                 return {
@@ -185,18 +632,51 @@ class RoutingCommands:
                             resolved = net_classes[net_class]
                     except Exception:
                         resolved = None
-                if resolved is not None:
-                    net.SetClass(resolved)
 
-            return {
+            # Report the class only where it actually landed: on the live board,
+            # in the project file (which is what survives a reload), or neither.
+            warnings: List[str] = []
+            assigned_class = "Default"
+            class_persisted = False
+            if net_class:
+                if resolved is None:
+                    warnings.append(
+                        f"net class '{net_class}' does not exist; the net was added "
+                        "without it (create it with create_netclass first)"
+                    )
+                else:
+                    try:
+                        set_net_class_in_memory(net, resolved)
+                        assigned_class = net_class
+                    except Exception as exc:
+                        warnings.append(f"in-memory net class assignment failed: {exc}")
+                    net_pro_path = _project_file_for(self.board)
+                    persist = persist_net_assignment_to_project(net_pro_path, name, net_class)
+                    warning = register_membership_in_project_settings(
+                        self.board, name, net_class, net_pro_path
+                    )
+                    if warning:
+                        warnings.append(warning)
+                    class_persisted = bool(persist.get("persisted"))
+                    if class_persisted:
+                        assigned_class = net_class
+                    elif persist.get("warning"):
+                        warnings.append(persist["warning"])
+
+            result: Dict[str, Any] = {
                 "success": True,
                 "message": f"Added net: {name}",
                 "net": {
                     "name": name,
-                    "class": net_class if net_class else "Default",
+                    "class": assigned_class,
                     "netcode": net.GetNetCode(),
                 },
             }
+            if net_class:
+                result["classPersisted"] = class_persisted
+            if warnings:
+                result["warning"] = "; ".join(warnings)
+            return result
 
         except Exception as e:
             logger.error(f"Error adding net: {str(e)}")
@@ -565,31 +1045,30 @@ class RoutingCommands:
                     "errorDetails": "Load or create a board first",
                 }
 
-            position = params.get("position")
-            size = params.get("size")
-            drill = params.get("drill")
-            net = params.get("net")
+            request, error = via_request(params)
+            if error:
+                return error
+            size = request["diameter_mm"]
+            drill = request["drill_mm"]
+            net = request["net"]
             from_layer = params.get("from_layer", "F.Cu")
             to_layer = params.get("to_layer", "B.Cu")
 
-            if not position:
-                return {
-                    "success": False,
-                    "message": "Missing position",
-                    "errorDetails": "position parameter is required",
-                }
+            net_obj = None
+            if net:
+                nets_map = self.board.GetNetInfo().NetsByName()
+                if not nets_map.has_key(net):
+                    return {
+                        "success": False,
+                        "message": "Net not found",
+                        "errorDetails": f"no net named {net!r} on the board",
+                    }
+                net_obj = nets_map[net]
 
             # Create via
             via = pcbnew.PCB_VIA(self.board)
-
-            # Set position
-            scale = (
-                1000000
-                if position["unit"] == "mm"
-                else (25400 if position["unit"] == "mil" else 25400000)
-            )  # mm, mil, or inch to nm
-            x_nm = int(position["x"] * scale)
-            y_nm = int(position["y"] * scale)
+            x_nm = int(round(request["x_mm"] * 1e6))
+            y_nm = int(round(request["y_mm"] * 1e6))
             via.SetPosition(pcbnew.VECTOR2I(x_nm, y_nm))
 
             # Set size and drill (default to board's current via settings)
@@ -608,13 +1087,16 @@ class RoutingCommands:
                 }
             via.SetLayerPair(from_id, to_id)
 
-            # Set net if provided
-            if net:
-                netinfo = self.board.GetNetInfo()
-                nets_map = netinfo.NetsByName()
-                if nets_map.has_key(net):
-                    net_obj = nets_map[net]
-                    via.SetNet(net_obj)
+            if net_obj is not None:
+                via.SetNet(net_obj)
+
+            # A via placed on its own is a free via, as KiCad's own "Add Free-Standing Via"
+            # makes it. A non-free via takes its net from the copper it touches when the
+            # board is saved: inside another net's zone, with no path to a pad of its own
+            # net yet, it was written to the file on the zone's net, so the via the reply
+            # described was not the via on the board.
+            if hasattr(via, "SetIsFree"):
+                via.SetIsFree(True)
 
             # Add via to board
             self.board.Add(via)
@@ -624,15 +1106,15 @@ class RoutingCommands:
                 "message": "Added via",
                 "via": {
                     "position": {
-                        "x": position["x"],
-                        "y": position["y"],
-                        "unit": position["unit"],
+                        "x": request["x"],
+                        "y": request["y"],
+                        "unit": request["unit"],
                     },
-                    "size": via.GetWidth(pcbnew.F_Cu) / 1000000,
+                    "size": _via_front_width(via) / 1000000,
                     "drill": via.GetDrill() / 1000000,
                     "from_layer": from_layer,
                     "to_layer": to_layer,
-                    "net": net,
+                    "net": via.GetNetname(),
                 },
             }
 
@@ -689,7 +1171,7 @@ class RoutingCommands:
 
                 deleted_count = len(tracks_to_remove)
                 for track in tracks_to_remove:
-                    self.board.Remove(track)
+                    delete_board_item(self.board, track)
                 tracks_to_remove.clear()
                 self.board.SetModified()
 
@@ -714,7 +1196,7 @@ class RoutingCommands:
                         "errorDetails": f"Could not find track with UUID: {trace_uuid}",
                     }
 
-                self.board.Remove(track)
+                delete_board_item(self.board, track)
                 track = None
                 self.board.SetModified()
                 return {"success": True, "message": f"Deleted track: {trace_uuid}"}
@@ -748,7 +1230,7 @@ class RoutingCommands:
                         closest_track = track
 
                 if closest_track and min_distance < 1000000:  # Within 1mm
-                    self.board.Remove(closest_track)
+                    delete_board_item(self.board, closest_track)
                     closest_track = None
                     self.board.SetModified()
                     return {
@@ -776,7 +1258,12 @@ class RoutingCommands:
         }
 
     def get_nets_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Get a list of all nets in the PCB"""
+        """Get a list of all nets in the PCB.
+
+        With ``includeStats`` each net also carries ``stats`` (track count,
+        total track length in ``unit``, via count). Both parameters are
+        declared by the zod schema and used to be ignored (#407).
+        """
         try:
             if not self.board:
                 return {
@@ -784,6 +1271,12 @@ class RoutingCommands:
                     "message": "No board is loaded",
                     "errorDetails": "Load or create a board first",
                 }
+
+            include_stats = bool(params.get("includeStats", False))
+            unit = params.get("unit") or "mm"
+            unit_error = length_unit_error(unit)
+            if unit_error:
+                return unit_error
 
             nets = []
             netinfo = self.board.GetNetInfo()
@@ -798,13 +1291,117 @@ class RoutingCommands:
                         }
                     )
 
-            return {"success": True, "nets": nets}
+            if not include_stats:
+                return {"success": True, "nets": nets}
+
+            tracks, vias = [], []
+            for item in self.board.GetTracks():
+                if item.Type() == pcbnew.PCB_VIA_T:
+                    vias.append(item.GetNetname())
+                else:  # straight tracks and arcs; GetLength() is the arc length for arcs
+                    tracks.append((item.GetNetname(), item.GetLength() / 1_000_000))
+            stats = net_stats(tracks, vias, unit)
+            empty = {"trackCount": 0, "trackLength": 0.0, "viaCount": 0}
+            for net in nets:
+                net["stats"] = dict(stats.get(net["name"], empty))
+            return {"success": True, "nets": nets, "unit": unit}
 
         except Exception as e:
             logger.error(f"Error getting nets list: {str(e)}")
             return {
                 "success": False,
                 "message": "Failed to get nets list",
+                "errorDetails": str(e),
+            }
+
+    def set_net_color(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Set or clear a net's display color override.
+
+        This is pure ``.kicad_pro`` persistence (``net_settings.net_colors``)
+        — there is no in-memory SWIG counterpart to update, since
+        ``NETINFO_ITEM`` has no color getter/setter (see module docstring
+        above ``apply_net_color_to_project_settings``).
+        """
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+
+            net_name = params.get("net")
+            color = params.get("color")
+            clear = params.get("clear", False)
+
+            if not net_name:
+                return {
+                    "success": False,
+                    "message": "Missing net name",
+                    "errorDetails": "net parameter is required",
+                }
+            if not clear and not color:
+                return {
+                    "success": False,
+                    "message": "Missing color",
+                    "errorDetails": "color is required unless clear is true",
+                }
+
+            netinfo = self.board.GetNetInfo()
+            nets_map = netinfo.NetsByName()
+            if not nets_map.has_key(net_name):
+                return {
+                    "success": False,
+                    "message": f"Net not found: {net_name}",
+                    "errorDetails": f"'{net_name}' does not exist on the board",
+                }
+
+            kicad_rgb = None
+            if not clear:
+                try:
+                    kicad_rgb = _hex_to_kicad_rgb(color)
+                except ValueError as exc:
+                    return {
+                        "success": False,
+                        "message": "Invalid color",
+                        "errorDetails": str(exc),
+                    }
+
+            pro_path = None
+            try:
+                board_path = self.board.GetFileName()
+                if board_path and board_path.endswith(".kicad_pcb"):
+                    pro_path = str(Path(board_path).with_suffix(".kicad_pro"))
+            except Exception:
+                pro_path = None
+
+            persist = persist_net_color_to_project(pro_path, net_name, kicad_rgb)
+            if not persist.get("persisted"):
+                return {
+                    "success": False,
+                    "message": "Failed to set net color",
+                    "errorDetails": persist.get("warning", "unknown persistence error"),
+                }
+
+            result = {
+                "success": True,
+                "message": (
+                    f"Cleared color for net: {net_name}"
+                    if clear
+                    else f"Set color for net {net_name} to {kicad_rgb}"
+                ),
+                "net": net_name,
+                "color": kicad_rgb,
+                "persisted": True,
+                "projectFile": persist.get("projectFile"),
+            }
+            return result
+
+        except Exception as e:
+            logger.error(f"Error setting net color: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to set net color",
                 "errorDetails": str(e),
             }
 
@@ -885,7 +1482,7 @@ class RoutingCommands:
                                 },
                                 "net": track.GetNetname(),
                                 "netCode": track.GetNetCode(),
-                                "diameter": track.GetWidth() / scale,
+                                "diameter": _via_front_width(track) / scale,
                                 "drill": track.GetDrillValue() / scale,
                             }
                         )
@@ -1062,7 +1659,10 @@ class RoutingCommands:
                 }
 
             # Identification parameters
-            trace_uuid = params.get("uuid")
+            # The zod schema (src/tools/routing.ts) declares `traceUuid`, matching
+            # delete_trace; `uuid` is kept for callers of the JSON-RPC path that
+            # predate the schema alignment (#403).
+            trace_uuid = params.get("traceUuid") or params.get("uuid")
             position = params.get("position")  # {x, y, unit}
 
             # Modification parameters
@@ -1074,7 +1674,7 @@ class RoutingCommands:
                 return {
                     "success": False,
                     "message": "Missing trace identifier",
-                    "errorDetails": "Provide either 'uuid' or 'position' to identify the trace",
+                    "errorDetails": "Provide either 'traceUuid' or 'position' to identify the trace",
                 }
 
             scale = 1000000  # nm to mm conversion
@@ -1330,7 +1930,7 @@ class RoutingCommands:
                 # Create new via
                 new_via = pcbnew.PCB_VIA(self.board)
                 new_via.SetPosition(pcbnew.VECTOR2I(pos.x + offset_x, pos.y + offset_y))
-                new_via.SetWidth(via.GetWidth(pcbnew.F_Cu))
+                new_via.SetWidth(_via_front_width(via))
                 new_via.SetDrill(via.GetDrillValue())
                 new_via.SetViaType(via.GetViaType())
 
@@ -1402,6 +2002,8 @@ class RoutingCommands:
             scale = 1000000  # mm to nm
             net_class_values: Dict[str, Any] = {}
             in_memory_warning = None
+            registration_warning = None
+            live_netclass = None
 
             # Best-effort in-memory NETCLASS for the live session. A SWIG failure
             # here is logged but must NOT skip the .kicad_pro persistence below,
@@ -1451,12 +2053,10 @@ class RoutingCommands:
                 _safe_set("SetDiffPairWidth", diff_pair_width)
                 _safe_set("SetDiffPairGap", diff_pair_gap)
 
-                netinfo = self.board.GetNetInfo()
-                nets_map = netinfo.NetsByName()
-                for net_name in nets:
-                    if nets_map.has_key(net_name):
-                        net = nets_map[net_name]
-                        net.SetClass(netclass)
+                live_netclass = netclass
+                registration_warning = register_netclass_in_project_settings(
+                    self.board, name, netclass
+                )
 
                 # Defensive accessors — KiCad 10's NETCLASS dropped some legacy getters.
                 def _safe_get(method_name):
@@ -1484,8 +2084,7 @@ class RoutingCommands:
 
             # Persist the class DEFINITION (net_settings.classes) using the same
             # normalized values as the live path, so the persisted class can never
-            # diverge from the request. Membership lives in netclass_patterns and
-            # is out of scope here (create_netclass exposes no `nets` field).
+            # diverge from the request. Membership is persisted further down.
             project_props = {
                 "clearance": clearance,
                 "track_width": track_width,
@@ -1498,7 +2097,9 @@ class RoutingCommands:
             }
             persist = persist_netclass_to_project(pro_path, name, project_props)
 
-            warnings = [w for w in (in_memory_warning, persist.get("warning")) if w]
+            warnings = [
+                w for w in (in_memory_warning, registration_warning, persist.get("warning")) if w
+            ]
             if in_memory_warning and not persist.get("persisted"):
                 # Neither the live board nor the project file received the class.
                 return {
@@ -1507,12 +2108,45 @@ class RoutingCommands:
                     "errorDetails": "; ".join(warnings),
                 }
 
+            # Membership: KiCad 7+ reads it from the project file
+            # (net_settings.netclass_assignments), as assign_net_to_class writes it,
+            # and from the in-memory settings that KiCad 9 writes back on save.
+            # Report the nets that were actually written, not the ones requested.
+            nets_map = self.board.GetNetInfo().NetsByName()
+            found = [n for n in nets if nets_map.has_key(n)]
+            missing = [n for n in nets if not nets_map.has_key(n)]
+            assigned: List[str] = []
+            if found:
+                for net_name in found:
+                    if live_netclass is None:
+                        break
+                    try:
+                        set_net_class_in_memory(nets_map[net_name], live_netclass)
+                    except Exception as exc:
+                        warnings.append(f"in-memory assignment of {net_name} failed: {exc}")
+                membership = persist_net_assignments_to_project(pro_path, found, name)
+                warning = register_memberships_in_project_settings(
+                    self.board, found, name, pro_path
+                )
+                if warning:
+                    warnings.append(warning)
+                if membership.get("persisted"):
+                    assigned = found
+                elif membership.get("warning"):
+                    warnings.append(membership["warning"])
+            if missing:
+                warnings.append("nets not on the board, not assigned: " + ", ".join(missing))
+
             result = {
                 "success": True,
-                "message": f"Created net class: {name}",
-                "netClass": {"name": name, "nets": nets, **net_class_values},
+                "message": f"Created net class: {name}"
+                + (f" with {len(assigned)} of {len(nets)} nets" if nets else ""),
+                "netClass": {"name": name, "nets": assigned, **net_class_values},
                 "persisted": persist.get("persisted", False),
             }
+            if nets:
+                result["netsAssigned"] = assigned
+                result["netsNotAssigned"] = [n for n in nets if n not in assigned]
             if persist.get("projectFile"):
                 result["projectFile"] = persist["projectFile"]
             if warnings:
@@ -1544,6 +2178,18 @@ class RoutingCommands:
             points = params.get("outline", params.get("points", []))
             priority = params.get("priority", 0)
             fill_type = params.get("fillType", "solid")  # solid or hatched
+            pad_connection = params.get("padConnection")  # thermal | solid | none
+            pad_connection_modes = {
+                "thermal": "ZONE_CONNECTION_THERMAL",
+                "solid": "ZONE_CONNECTION_FULL",
+                "none": "ZONE_CONNECTION_NONE",
+            }
+            if pad_connection is not None and pad_connection not in pad_connection_modes:
+                return {
+                    "success": False,
+                    "message": "Invalid padConnection",
+                    "errorDetails": "padConnection must be one of thermal, solid, none",
+                }
 
             # If no outline provided, use board outline
             if not points or len(points) < 3:
@@ -1594,13 +2240,18 @@ class RoutingCommands:
             zone = pcbnew.ZONE(self.board)
             zone.SetLayer(layer_id)
 
-            # Set net if provided
+            # Set net if provided. An unknown name used to be ignored, which
+            # left a net-less zone on the board while reporting success.
             if net:
                 netinfo = self.board.GetNetInfo()
                 nets_map = netinfo.NetsByName()
-                if nets_map.has_key(net):
-                    net_obj = nets_map[net]
-                    zone.SetNet(net_obj)
+                if not nets_map.has_key(net):
+                    return {
+                        "success": False,
+                        "message": "Unknown net",
+                        "errorDetails": f"Net '{net}' does not exist on the board",
+                    }
+                zone.SetNet(nets_map[net])
 
             # Set zone properties
             scale = 1000000  # mm to nm
@@ -1610,6 +2261,9 @@ class RoutingCommands:
                 zone.SetLocalClearance(int(clearance * scale))
 
             zone.SetMinThickness(int(min_width * scale))
+
+            if pad_connection is not None:
+                zone.SetPadConnection(getattr(pcbnew, pad_connection_modes[pad_connection]))
 
             # Set fill type
             if fill_type == "hatched":
@@ -1651,6 +2305,7 @@ class RoutingCommands:
                     "minWidth": min_width,
                     "priority": priority,
                     "fillType": fill_type,
+                    "padConnection": pad_connection or "thermal",
                     "pointCount": len(points),
                 },
             }
@@ -1675,8 +2330,11 @@ class RoutingCommands:
 
             start_pos = params.get("startPos")
             end_pos = params.get("endPos")
-            net_pos = params.get("netPos")
-            net_neg = params.get("netNeg")
+            # The schemas declare `positiveNet` / `negativeNet` (#407); `netPos` /
+            # `netNeg` are the keys this handler historically read, kept so
+            # existing callers keep working.
+            net_pos = params.get("positiveNet") or params.get("netPos")
+            net_neg = params.get("negativeNet") or params.get("netNeg")
             layer = params.get("layer", "F.Cu")
             width = params.get("width")
             gap = params.get("gap")
@@ -1685,7 +2343,7 @@ class RoutingCommands:
                 return {
                     "success": False,
                     "message": "Missing parameters",
-                    "errorDetails": "startPos, endPos, netPos, and netNeg are required",
+                    "errorDetails": "startPos, endPos, positiveNet, and negativeNet are required",
                 }
 
             # Get layer ID
@@ -1743,9 +2401,19 @@ class RoutingCommands:
             # Convert to nm
             gap_nm = int(gap * 1000000)
 
-            # Calculate offsets
-            offset_x = int(px * gap_nm / 2)
-            offset_y = int(py * gap_nm / 2)
+            if width:
+                trace_width_nm = int(width * 1000000)
+            else:
+                # Get default width from design rules or net class
+                trace_width_nm = self.board.GetDesignSettings().GetCurrentTrackWidth()
+
+            # `gap` is the edge-to-edge spacing, as KiCad's differential pair
+            # rules define it, so the centrelines sit (gap + width) / 2 either
+            # side of the path. Offsetting by gap / 2 left only gap - width of
+            # copper between the traces, and overlapped them when width >= gap.
+            offset_nm = (gap_nm + trace_width_nm) / 2
+            offset_x = int(px * offset_nm)
+            offset_y = int(py * offset_nm)
 
             # Create positive and negative trace points
             pos_start = pcbnew.VECTOR2I(
@@ -1771,16 +2439,8 @@ class RoutingCommands:
             neg_track.SetLayer(layer_id)
             neg_track.SetNet(net_neg_obj)
 
-            # Set width
-            if width:
-                trace_width_nm = int(width * 1000000)
-                pos_track.SetWidth(trace_width_nm)
-                neg_track.SetWidth(trace_width_nm)
-            else:
-                # Get default width from design rules or net class
-                trace_width = self.board.GetDesignSettings().GetCurrentTrackWidth()
-                pos_track.SetWidth(trace_width)
-                neg_track.SetWidth(trace_width)
+            pos_track.SetWidth(trace_width_nm)
+            neg_track.SetWidth(trace_width_nm)
 
             # Add tracks to board
             self.board.Add(pos_track)
@@ -2045,7 +2705,7 @@ class RoutingCommands:
                 is_via = False
             if is_via:
                 pos = track.GetPosition()
-                width = track.GetWidth()
+                width = _via_front_width(track)
                 drill = 0
                 try:
                     drill = track.GetDrill()
@@ -2053,8 +2713,20 @@ class RoutingCommands:
                     pass
                 obstacle_vias.append((pos.x, pos.y, max(width, drill) // 2))
             else:
-                s, e = track.GetStart(), track.GetEnd()
-                obstacle_tracks.append((s.x, s.y, e.x, e.y, track.GetWidth() // 2))
+                half_width = track.GetWidth() // 2
+                # A PCB_ARC recorded as the straight chord between its
+                # endpoints UNDER-estimates the region it occupies: a via
+                # sitting in the bulge between chord and arc passes the
+                # clearance check and shorts the trace (#192). Approximate the
+                # arc by a chain of short chords instead — over-approximating
+                # an obstacle is safe, under-approximating is the bug.
+                arc_points = _arc_polyline_points(track)
+                if arc_points:
+                    for (ax1, ay1), (ax2, ay2) in zip(arc_points, arc_points[1:]):
+                        obstacle_tracks.append((ax1, ay1, ax2, ay2, half_width))
+                else:
+                    s, e = track.GetStart(), track.GetEnd()
+                    obstacle_tracks.append((s.x, s.y, e.x, e.y, half_width))
 
         for fp in self.board.GetFootprints():
             for pad in fp.Pads():
@@ -2216,6 +2888,129 @@ class RoutingCommands:
 # ---------------------------------------------------------------------------
 # Module-level geometry helper (used by add_gnd_stitching_vias collision check)
 # ---------------------------------------------------------------------------
+
+
+# Chord count for arc approximation. 8 chords keeps the worst-case sagitta
+# (the gap between a chord and the arc it spans) under ~2% of the radius, which
+# is far below any realistic via-to-track clearance, while staying cheap in the
+# obstacle-gathering loop.
+_ARC_CHORD_SEGMENTS = 8
+
+
+def _via_front_width(via: Any) -> int:
+    """Return a via's front-copper width in nanometres, across KiCad 8, 9 and 10.
+
+    KiCad 9 moved vias onto per-layer padstacks, so ``PCB_VIA`` gained
+    ``GetWidth( PCB_LAYER_ID )`` and the ``GetFrontWidth()`` convenience wrapper
+    that forwards to it (``pcbnew/pcb_track.h`` 9.0 lines 433 and 437). The
+    inherited no-argument ``GetWidth()`` survives only to satisfy the parent
+    class and now trips a ``wxCHECK_MSG`` -- ``pcbnew/pcb_track.cpp`` 9.0:381
+    and 10.0:387, "PCB_VIA::GetWidth called without a layer argument". Under a
+    stable Windows build that surfaces as a modal wxWidgets debug alert, once
+    per via, which is what users actually hit.
+
+    The check returns ``m_padStack.Size( PADSTACK::ALL_LAYERS ).x``, so the
+    returned value was never wrong. The defect is the dialog, not the geometry.
+
+    KiCad 8 has neither accessor: its ``PCB_VIA`` only inherits
+    ``PCB_TRACK::GetWidth()`` (``pcbnew/pcb_track.h`` 8.0 line 107), where the
+    call is legal and silent. This server still supports 8.0 in CI, so calling
+    ``GetFrontWidth()`` unconditionally would trade a cosmetic warning on 9/10
+    for a hard ``AttributeError`` on 8 -- and passing ``F_Cu`` explicitly would
+    raise ``TypeError`` there for the same reason.
+
+    Probing for the attribute rather than branching on a version string keeps
+    this correct for any build that backports or drops the accessor, and works
+    with the test doubles, which define only the methods a case needs.
+    """
+    front_width = getattr(via, "GetFrontWidth", None)
+    if front_width is not None:
+        return int(front_width())
+    # KiCad 8 and earlier: the inherited accessor is the only one, and is the
+    # correct call there -- a via had a single width across all layers.
+    return int(via.GetWidth())
+
+
+def _arc_polyline_points(track: Any) -> List[Tuple[int, int]]:
+    """Sample a PCB_ARC into points for a chord-chain approximation.
+
+    Returns ``[]`` for anything that is not an arc, so the caller falls back to
+    its straight-segment handling. Never raises: an obstacle we cannot sample
+    must degrade to the chord rather than abort the whole stitching run.
+
+    The module checks item class by ``GetClass()`` string rather than
+    ``isinstance`` -- see the note in ``add_gnd_stitching_vias`` -- and the test
+    doubles set ``GetClass`` directly, so this matches that convention.
+    """
+    try:
+        if track.GetClass() != "PCB_ARC":
+            return []
+    except Exception:
+        return []
+
+    try:
+        centre = track.GetCenter()
+        cx, cy = int(centre.x), int(centre.y)
+        start, end = track.GetStart(), track.GetEnd()
+        sx, sy = int(start.x), int(start.y)
+        ex, ey = int(end.x), int(end.y)
+    except Exception:
+        return []
+
+    radius = math.hypot(sx - cx, sy - cy)
+    if radius <= 0:
+        return []
+
+    start_angle = math.atan2(sy - cy, sx - cx)
+    end_angle = math.atan2(ey - cy, ex - cx)
+    sweep = end_angle - start_angle
+
+    # Pick the sweep direction that passes through the arc's midpoint, so a
+    # major arc is not approximated by the minor one on the other side.
+    try:
+        mid = track.GetMid()
+        mid_angle = math.atan2(int(mid.y) - cy, int(mid.x) - cx)
+
+        def _normalise(a: float) -> float:
+            while a <= -math.pi:
+                a += 2 * math.pi
+            while a > math.pi:
+                a -= 2 * math.pi
+            return a
+
+        # If the midpoint does not lie within the shorter sweep, go the long way.
+        short = _normalise(sweep)
+        to_mid = _normalise(mid_angle - start_angle)
+        if short == 0 or (to_mid / short) < 0 or abs(to_mid) > abs(short):
+            sweep = short - math.copysign(2 * math.pi, short)
+        else:
+            sweep = short
+    except Exception:
+        # No usable midpoint: fall back to the shorter sweep.
+        while sweep <= -math.pi:
+            sweep += 2 * math.pi
+        while sweep > math.pi:
+            sweep -= 2 * math.pi
+
+    # Sample on a slightly LARGER radius so the chords circumscribe the arc
+    # instead of cutting inside it. Chords through points on the true arc are
+    # secants: their midpoints sag inward by r*(1 - cos(half_step)), which
+    # under-states the obstacle — the same defect as #192, just smaller.
+    # Dividing by cos(half_step) puts each chord's midpoint back on the true
+    # radius, so the chain never reads as further from a point than the arc is.
+    half_step = abs(sweep) / (2 * _ARC_CHORD_SEGMENTS)
+    sample_radius = radius / math.cos(half_step) if half_step else radius
+
+    points: List[Tuple[int, int]] = []
+    for i in range(_ARC_CHORD_SEGMENTS + 1):
+        angle = start_angle + sweep * (i / _ARC_CHORD_SEGMENTS)
+        points.append(
+            (
+                int(cx + sample_radius * math.cos(angle)),
+                int(cy + sample_radius * math.sin(angle)),
+            )
+        )
+    return points
 
 
 def _point_to_segment_distance_nm(px: int, py: int, x1: int, y1: int, x2: int, y2: int) -> float:

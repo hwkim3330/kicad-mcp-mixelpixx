@@ -7,14 +7,20 @@ Uses S-expression parsing to extract pin data from symbol definitions.
 
 import logging
 import math
+import os
 import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import sexpdata
+from commands.schematic import SchematicLoadError, SchematicManager
 from sexpdata import Symbol
-from skip import Schematic
+
+try:
+    from skip import Schematic  # noqa: F401 (unused here, but tests patch this name)
+except ImportError:
+    Schematic = None
 
 logger = logging.getLogger("kicad_interface")
 
@@ -22,11 +28,57 @@ logger = logging.getLogger("kicad_interface")
 class PinLocator:
     """Locate pins on symbol instances in KiCad schematics"""
 
-    def __init__(self) -> None:
-        """Initialize pin locator with empty cache"""
-        self.pin_definition_cache = {}  # Cache: "lib_id:symbol_name" -> pin_data
+    def __init__(self, memoize_pins: bool = False) -> None:
+        """Initialize pin locator with empty cache.
+
+        memoize_pins: remember get_all_symbol_pins results per (schematic,
+            reference) for the life of this locator. Only a locator created for
+            a single read-only request should enable it (list_schematic_nets and
+            the batched net resolution do, where it saves re-locating every
+            symbol once per net). ConnectionManager's long-lived locator leaves
+            it off; _cache_key drops the memo's entries when the file changes.
+        """
+        self.pin_definition_cache = {}  # Cache: "<path>:<lib_id>" -> pin_data
         self._schematic_cache: Dict[str, object] = {}  # Cache: path -> loaded Schematic
         self._sexp_cache: Dict[str, Any] = {}  # Cache: path -> parsed sexpdata (mirror-aware)
+        # path -> (mtime_ns, size) of the file when its entries were cached
+        self._cache_stamps: Dict[str, Optional[Tuple[int, int]]] = {}
+        # Cache: (path, reference) -> get_all_symbol_pins result; only used
+        # when memoize_pins is set (see above).
+        self._memoize_pins = memoize_pins
+        self._all_pins_cache: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
+
+    def _remember_pins(self, key: Tuple[str, str], pins: Dict[str, List[float]]) -> None:
+        if self._memoize_pins:
+            self._all_pins_cache[key] = pins
+
+    def _cache_key(self, schematic_path: Any) -> str:
+        """Cache key for *schematic_path*, dropping its entries if the file changed.
+
+        The caches used to be keyed by path alone and never refreshed. That was
+        harmless for a locator built per call, but ConnectionManager keeps one
+        locator for the life of the worker, so after a component was moved or
+        rotated, connect_to_net and connect_passthrough kept answering with the
+        pin positions from before the edit and placed labels where the pins used
+        to be. The file's (mtime_ns, size) is checked on every lookup instead.
+        """
+        key = str(schematic_path)
+        try:
+            st = os.stat(key)
+            stamp: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
+        if key in self._cache_stamps and self._cache_stamps[key] == stamp:
+            return key
+        self._schematic_cache.pop(key, None)
+        self._sexp_cache.pop(key, None)
+        prefix = key + ":"
+        for cached in [k for k in self.pin_definition_cache if k.startswith(prefix)]:
+            del self.pin_definition_cache[cached]
+        for memo_key in [k for k in self._all_pins_cache if k[0] == key]:
+            del self._all_pins_cache[memo_key]
+        self._cache_stamps[key] = stamp
+        return key
 
     @staticmethod
     def parse_symbol_definition(symbol_def: list) -> Dict[str, Dict]:
@@ -134,8 +186,8 @@ class PinLocator:
         Returns:
             Dictionary mapping pin number -> pin data
         """
-        # Check cache
-        cache_key = f"{schematic_path}:{lib_id}"
+        # Check cache (after dropping this file's entries if it changed on disk)
+        cache_key = f"{self._cache_key(schematic_path)}:{lib_id}"
         if cache_key in self.pin_definition_cache:
             logger.debug(f"Using cached pin data for {lib_id}")
             return self.pin_definition_cache[cache_key]
@@ -198,6 +250,8 @@ class PinLocator:
             logger.warning(f"Symbol {lib_id} not found in lib_symbols")
             return {}
 
+        except SchematicLoadError:
+            raise
         except Exception as e:
             logger.error(f"Error getting symbol pins: {e}")
             import traceback
@@ -237,13 +291,15 @@ class PinLocator:
     def _get_lib_id(self, schematic_path: Path, symbol_reference: str) -> Optional[str]:
         """Helper: return the lib_id string for a placed symbol"""
         try:
-            sch_key = str(schematic_path)
+            sch_key = self._cache_key(schematic_path)
             if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
+                self._schematic_cache[sch_key] = SchematicManager.load_schematic(sch_key)
             sch = self._schematic_cache[sch_key]
             for symbol in sch.symbol:
                 if symbol.property.Reference.value.rstrip("_") == symbol_reference:
                     return symbol.lib_id.value if hasattr(symbol, "lib_id") else None
+        except SchematicLoadError:
+            raise
         except Exception:
             pass
         return None
@@ -267,7 +323,7 @@ class PinLocator:
         import sexpdata as _sexpdata
         from commands.wire_dragger import WireDragger
 
-        sch_key = str(schematic_path)
+        sch_key = self._cache_key(schematic_path)
         try:
             if sch_key not in self._sexp_cache:
                 with open(schematic_path, "r", encoding="utf-8") as f:
@@ -432,6 +488,8 @@ class PinLocator:
             )
             return math.degrees(math.atan2(-(ey - by), ex - bx)) % 360.0
 
+        except SchematicLoadError:
+            raise
         except Exception:
             return None
 
@@ -452,9 +510,9 @@ class PinLocator:
         try:
             # Load schematic with kicad-skip to get symbol instance
             # Use cache to avoid reloading the file for every pin lookup
-            sch_key = str(schematic_path)
+            sch_key = self._cache_key(schematic_path)
             if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
+                self._schematic_cache[sch_key] = SchematicManager.load_schematic(sch_key)
             sch = self._schematic_cache[sch_key]
 
             # Find the symbol instance.
@@ -548,6 +606,8 @@ class PinLocator:
             logger.info(f"Pin {symbol_reference}/{pin_number} located at ({abs_x}, {abs_y})")
             return [abs_x, abs_y]
 
+        except SchematicLoadError:
+            raise
         except Exception as e:
             logger.error(f"Error getting pin location: {e}")
             import traceback
@@ -566,13 +626,17 @@ class PinLocator:
             symbol_reference: Symbol reference designator (e.g., "R1", "U1")
 
         Returns:
-            Dictionary mapping pin number -> [x, y] coordinates
+            Dictionary mapping pin number -> [x, y] coordinates.
+            The returned dict is cached and shared — treat it as read-only.
         """
         try:
             # Load schematic (use cache)
-            sch_key = str(schematic_path)
+            sch_key = self._cache_key(schematic_path)
+            cache_key = (sch_key, symbol_reference)
+            if self._memoize_pins and cache_key in self._all_pins_cache:
+                return self._all_pins_cache[cache_key]
             if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
+                self._schematic_cache[sch_key] = SchematicManager.load_schematic(sch_key)
             sch = self._schematic_cache[sch_key]
 
             # Find symbol
@@ -584,17 +648,20 @@ class PinLocator:
 
             if not target_symbol:
                 logger.error(f"Symbol {symbol_reference} not found")
+                self._remember_pins(cache_key, {})
                 return {}
 
             # Get lib_id
             lib_id = target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
             if not lib_id:
                 logger.error(f"Symbol {symbol_reference} has no lib_id")
+                self._remember_pins(cache_key, {})
                 return {}
 
             # Get pin definitions
             pins = self.get_symbol_pins(schematic_path, lib_id)
             if not pins:
+                self._remember_pins(cache_key, {})
                 return {}
 
             # Calculate location for each pin
@@ -605,8 +672,11 @@ class PinLocator:
                     result[pin_num] = location
 
             logger.info(f"Located {len(result)} pins on {symbol_reference}")
+            self._remember_pins(cache_key, result)
             return result
 
+        except SchematicLoadError:
+            raise
         except Exception as e:
             logger.error(f"Error getting all symbol pins: {e}")
             return {}

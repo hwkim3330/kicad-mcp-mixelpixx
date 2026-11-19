@@ -17,6 +17,7 @@ from typing import Any, List, Optional, Tuple
 import sexpdata
 from sexpdata import Symbol
 from utils.sexpr_format import dumps as kicad_dumps
+from utils.sexpr_format import escape_sexpr_string, match_paren
 
 logger = logging.getLogger("kicad_interface")
 
@@ -41,6 +42,26 @@ _SYM_PIN = Symbol("pin")
 _SYM_SYMBOL = Symbol("symbol")
 _SYM_UNIT = Symbol("unit")
 _IU_PER_MM = 10000
+
+# batch_connect replace=True removes labels this close (per axis, mm) to a
+# cleared position. The planner's "cleared by this batch" check uses the same
+# value, so a label the write removes is never chosen as a wiring target.
+REPLACE_TOLERANCE_MM = 0.5
+
+
+def _iu(x: float, y: float) -> Tuple[int, int]:
+    return round(float(x) * _IU_PER_MM), round(float(y) * _IU_PER_MM)
+
+
+def _strictly_inside(p: Tuple[int, int], seg: Tuple[int, int, int, int]) -> bool:
+    """True when point *p* lies on segment *seg* (integer units), not at an end."""
+    px, py = p
+    x1, y1, x2, y2 = seg
+    if (px, py) in ((x1, y1), (x2, y2)):
+        return False
+    if (x2 - x1) * (py - y1) != (y2 - y1) * (px - x1):  # not collinear
+        return False
+    return min(x1, x2) <= px <= max(x1, x2) and min(y1, y2) <= py <= max(y1, y2)
 
 
 def _find_insertion_point(content: str) -> int:
@@ -97,7 +118,7 @@ def _make_hierarchical_label_text(
     uid = str(uuid.uuid4())
     justify = "right" if orientation == 180 else "left"
     return (
-        f'\t(hierarchical_label "{text}"\n'
+        f'\t(hierarchical_label "{escape_sexpr_string(text)}"\n'
         f"\t\t(shape {shape})\n"
         f"\t\t(at {position[0]} {position[1]} {orientation})\n"
         f"\t\t(effects\n"
@@ -124,7 +145,7 @@ def _make_sheet_pin_text(
     uid = str(uuid.uuid4())
     justify = "left" if orientation == 0 else "right"
     return (
-        f'\t\t(pin "{pin_name}" {pin_type}\n'
+        f'\t\t(pin "{escape_sexpr_string(pin_name)}" {pin_type}\n'
         f"\t\t\t(at {position[0]} {position[1]} {orientation})\n"
         f'\t\t\t(uuid "{uid}")\n'
         f"\t\t\t(effects\n"
@@ -300,6 +321,238 @@ class WireManager:
             return False
 
     @staticmethod
+    def _make_label_sexp(
+        text: str, position: List[float], label_type: str, orientation: int
+    ) -> list:
+        """The S-expression of one net label, as add_label writes it."""
+        # Orientation-aware justify: KiCAD flips horizontal alignment for 180°/270°
+        justify_h = Symbol("right") if orientation in (180, 270) else Symbol("left")
+        justify_expr = [Symbol("justify"), justify_h]
+        if label_type == "label":
+            justify_expr.append(Symbol("bottom"))
+        return [
+            Symbol(label_type),
+            text,
+            [Symbol("at"), position[0], position[1], orientation],
+            [
+                Symbol("effects"),
+                [Symbol("font"), [Symbol("size"), 1.27, 1.27]],
+                justify_expr,
+            ],
+            [Symbol("uuid"), str(uuid.uuid4())],
+        ]
+
+    @staticmethod
+    def _label_to_clear(item: Any, net: str, position: List[float], tolerance: float) -> bool:
+        """True for a label batch_connect replace=True removes at *position*.
+
+        That is any local label there, whatever its text (the pin is getting a
+        new net), and a global or hierarchical label there carrying *net*.
+        """
+        if not (isinstance(item, list) and len(item) > 1):
+            return False
+        if item[0] == _SYM_LABEL:
+            pass
+        elif item[0] in (_SYM_GLOBAL_LABEL, _SYM_HIERARCHICAL_LABEL) and item[1] == net:
+            pass
+        else:
+            return False
+        at = next(
+            (p for p in item[1:] if isinstance(p, list) and len(p) >= 3 and p[0] == _SYM_AT),
+            None,
+        )
+        if at is None:
+            return False
+        return (
+            abs(float(at[1]) - float(position[0])) < tolerance
+            and abs(float(at[2]) - float(position[1])) < tolerance
+        )
+
+    @staticmethod
+    def _wire_keys(sch_data: list) -> set:
+        """The unordered endpoint pairs of every two-point wire in *sch_data*."""
+        keys = set()
+        for item in sch_data:
+            if not (isinstance(item, list) and item and item[0] == _SYM_WIRE):
+                continue
+            pts = next(
+                (p for p in item[1:] if isinstance(p, list) and p and p[0] == _SYM_PTS), None
+            )
+            if pts is None:
+                continue
+            xy = [
+                (round(float(p[1]), 3), round(float(p[2]), 3))
+                for p in pts[1:]
+                if isinstance(p, list) and len(p) >= 3 and p[0] == _SYM_XY
+            ]
+            if len(xy) == 2:
+                keys.add(frozenset(xy))
+        return keys
+
+    @staticmethod
+    def pin_label_wires(sch_data: list, pins: List[List[float]]) -> List[dict]:
+        """Two-point wires that run from one of *pins* to a label.
+
+        batch_connect's stubLength draws exactly this: a wire out of the pin
+        with the net label at its far end. replace=True has to know about such
+        wires from an earlier run, whatever stub length that run used, or the
+        old label keeps the pin on its old net next to the new one.
+
+        Each result is a dict with "pin" and "far" ([x, y]), "local" (texts of
+        the local labels at the far end), "other" ((kind, text) of global and
+        hierarchical labels there), "far_is_pin" (another pin sits at the far
+        end, as in a "wired to existing label" wire) and "far_shared" (another
+        wire also ends at or passes through the far end). Wires whose far end
+        carries no label are not returned. Positions match exactly, in KiCad's
+        internal units, the way KiCad decides connectivity.
+        """
+        wanted = {_iu(p[0], p[1]): [float(p[0]), float(p[1])] for p in pins}
+        if not wanted:
+            return []
+        segs = []
+        for item in sch_data:
+            parsed = WireManager._parse_wire(item)
+            if parsed is not None:
+                segs.append((_iu(*parsed[0]), _iu(*parsed[1]), parsed[0], parsed[1]))
+        labels: dict = {}
+        for item in sch_data:
+            if not (
+                isinstance(item, list)
+                and len(item) > 1
+                and item[0] in (_SYM_LABEL, _SYM_GLOBAL_LABEL, _SYM_HIERARCHICAL_LABEL)
+            ):
+                continue
+            at = next(
+                (p for p in item[1:] if isinstance(p, list) and len(p) >= 3 and p[0] == _SYM_AT),
+                None,
+            )
+            if at is not None:
+                labels.setdefault(_iu(at[1], at[2]), []).append((str(item[0]), str(item[1])))
+        all_pins = {_iu(x, y) for x, y in WireManager._collect_pin_positions(sch_data)}
+
+        found = []
+        for i, (a, b, a_mm, b_mm) in enumerate(segs):
+            for here, far, far_mm in ((a, b, b_mm), (b, a, a_mm)):
+                if here not in wanted or far == here or far not in labels:
+                    continue
+                at_far = labels[far]
+                shared = any(
+                    j != i and (far in (c, d) or _strictly_inside(far, (*c, *d)))
+                    for j, (c, d, _, _) in enumerate(segs)
+                )
+                found.append(
+                    {
+                        "pin": wanted[here],
+                        "far": [float(far_mm[0]), float(far_mm[1])],
+                        "local": [t for k, t in at_far if k == "label"],
+                        "other": [(k, t) for k, t in at_far if k != "label"],
+                        "far_is_pin": far in all_pins,
+                        "far_shared": shared,
+                    }
+                )
+        return found
+
+    @staticmethod
+    def add_labels_and_wires(
+        schematic_path: Path,
+        labels: List[Tuple[str, List[float], str, int]],
+        wires: List[Tuple[List[float], List[float]]],
+        clear: Optional[List[Tuple[str, List[float]]]] = None,
+        tolerance: float = REPLACE_TOLERANCE_MM,
+        remove_wires: Optional[List[Tuple[List[float], List[float]]]] = None,
+    ) -> bool:
+        """Add several labels and wires in one read-modify-write of the file.
+
+        *labels* holds (text, position, label_type, orientation) tuples and
+        *wires* (start, end) pairs. The result is the same as calling add_label
+        and add_wire once per item, in that order, but the file is parsed and
+        written once instead of once per item. On a large sheet a parse plus a
+        write costs about a second, so a per-item batch of a dozen labels ran
+        past the bridge's 30 s timeout and the worker was restarted mid-batch,
+        leaving only some of the labels written.
+
+        *clear* holds (net, position) pairs, for batch_connect's replace=True:
+        before anything is added, every local label within *tolerance* of
+        *position*, and every global or hierarchical label of *net* there, is
+        removed. Removal and insertion are the same write, so if the write
+        fails the old labels are still in the file, rather than gone with
+        nothing new in their place.
+
+        *remove_wires* holds (start, end) pairs: every two-point wire with
+        exactly those endpoints (either direction) is removed in the same pass,
+        for replace=True's old stub wires (see pin_label_wires).
+
+        A wire whose two endpoints already belong to a wire in the file is not
+        added again, so re-running a stub batch does not stack a second wire
+        on the first.
+        """
+        clear = clear or []
+        drop = {frozenset((_iu(*s), _iu(*e))) for s, e in (remove_wires or [])}
+        if not labels and not wires and not clear and not drop:
+            return True
+        try:
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                sch_data = sexpdata.loads(f.read())
+
+            if clear or drop:
+                kept = []
+                removed = dropped = 0
+                for item in sch_data:
+                    if any(WireManager._label_to_clear(item, n, p, tolerance) for n, p in clear):
+                        removed += 1
+                        continue
+                    if drop:
+                        parsed = WireManager._parse_wire(item)
+                        if parsed and frozenset((_iu(*parsed[0]), _iu(*parsed[1]))) in drop:
+                            dropped += 1
+                            continue
+                    kept.append(item)
+                sch_data[:] = kept
+                if removed or dropped:
+                    logger.info(f"Cleared {removed} label(s) and {dropped} wire(s) for replacement")
+
+            new_items = [
+                WireManager._make_label_sexp(text, position, label_type, orientation)
+                for text, position, label_type, orientation in labels
+            ]
+            present = WireManager._wire_keys(sch_data)
+            for start, end in wires:
+                key = frozenset(
+                    (
+                        (round(float(start[0]), 3), round(float(start[1]), 3)),
+                        (round(float(end[0]), 3), round(float(end[1]), 3)),
+                    )
+                )
+                if key in present:
+                    continue
+                present.add(key)
+                for pt in (start, end):
+                    WireManager._break_wires_at_point(sch_data, pt)
+                new_items.append(WireManager._make_wire_sexp(start, end, 0, "default"))
+            # After _break_wires_at_point, so the index accounts for any split segments.
+            insert_at = next(
+                (
+                    i
+                    for i, item in enumerate(sch_data)
+                    if isinstance(item, list) and item and item[0] == _SYM_SHEET_INSTANCES
+                ),
+                len(sch_data),
+            )
+            sch_data[insert_at:insert_at] = new_items
+            if wires or drop:
+                WireManager.sync_junctions(sch_data)
+
+            with open(schematic_path, "w", encoding="utf-8") as f:
+                f.write(kicad_dumps(sch_data))
+            logger.info(
+                f"Added {len(labels)} label(s) and {len(wires)} wire(s) to {schematic_path.name}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error adding labels and wires: {e}")
+            return False
+
+    @staticmethod
     def add_label(
         schematic_path: Path,
         text: str,
@@ -325,25 +578,7 @@ class WireManager:
                 sch_content = f.read()
 
             sch_data = sexpdata.loads(sch_content)
-
-            # Orientation-aware justify: KiCAD flips horizontal alignment for 180°/270°
-            justify_h = Symbol("right") if orientation in (180, 270) else Symbol("left")
-
-            justify_expr = [Symbol("justify"), justify_h]
-            if label_type == "label":
-                justify_expr.append(Symbol("bottom"))
-
-            label_sexp = [
-                Symbol(label_type),
-                text,
-                [Symbol("at"), position[0], position[1], orientation],
-                [
-                    Symbol("effects"),
-                    [Symbol("font"), [Symbol("size"), 1.27, 1.27]],
-                    justify_expr,
-                ],
-                [Symbol("uuid"), str(uuid.uuid4())],
-            ]
+            label_sexp = WireManager._make_label_sexp(text, position, label_type, orientation)
 
             sheet_instances_index = None
             for i, item in enumerate(sch_data):
@@ -489,6 +724,24 @@ class WireManager:
                 endpoints.append((x1, y1))
                 endpoints.append((x2, y2))
         return endpoints
+
+    @staticmethod
+    def _collect_wire_segments_iu(sch_data: list) -> List[Tuple[int, int, int, int]]:
+        """Every wire as (x1, y1, x2, y2) in KiCad internal units."""
+        segments = []
+        for item in sch_data:
+            parsed = WireManager._parse_wire(item)
+            if parsed is not None:
+                (x1, y1), (x2, y2), _, _ = parsed
+                segments.append(
+                    (
+                        round(x1 * _IU_PER_MM),
+                        round(y1 * _IU_PER_MM),
+                        round(x2 * _IU_PER_MM),
+                        round(y2 * _IU_PER_MM),
+                    )
+                )
+        return segments
 
     @staticmethod
     def _get_existing_junctions(sch_data: list) -> dict:
@@ -693,8 +946,24 @@ class WireManager:
             (round(x * _IU_PER_MM), round(y * _IU_PER_MM)) for x, y in pin_positions
         )
 
+        # A wire end on the interior of another wire (a T drawn without
+        # splitting the through-wire) connects only with a junction there:
+        # without one KiCad leaves it open, and a junction already there was
+        # removed as stale. The through-wire counts as two connections, as
+        # its two halves would if KiCad's editor had split it. A pin sitting
+        # mid-wire is deliberately not counted: KiCad treats it as
+        # unconnected, and dotting it would change the netlist.
+        through_iu: Counter = Counter()
+        segments = WireManager._collect_wire_segments_iu(sch_data)
+        for iu in wire_iu:
+            through_iu[iu] = 2 * sum(1 for seg in segments if _strictly_inside(iu, seg))
+
         # wire_iu.items() guarantees wire_cnt >= 1, so no extra guard needed
-        needed_iu = {iu for iu, wire_cnt in wire_iu.items() if wire_cnt + pin_iu.get(iu, 0) >= 3}
+        needed_iu = {
+            iu
+            for iu, wire_cnt in wire_iu.items()
+            if wire_cnt + pin_iu.get(iu, 0) + through_iu[iu] >= 3
+        }
 
         existing = WireManager._get_existing_junctions(sch_data)
         existing_iu = set(existing.keys())
@@ -712,18 +981,21 @@ class WireManager:
                 sheet_instances_index = i
                 break
 
+        # A hierarchical sub-sheet has no (sheet_instances): append at the end,
+        # as add_label and add_wire do. Skipping the insert there left every
+        # junction a sub-sheet needed unwritten, so tool-drawn T's on any
+        # child sheet stayed open.
+        if sheet_instances_index is None:
+            sheet_instances_index = len(sch_data)
+
         to_add = needed_iu - existing_iu
         added = 0
-        if to_add:
-            if sheet_instances_index is None:
-                logger.warning("sync_junctions: no sheet_instances found, skipping junction insert")
-            else:
-                for iu_x, iu_y in to_add:
-                    x = iu_x / _IU_PER_MM
-                    y = iu_y / _IU_PER_MM
-                    sch_data.insert(sheet_instances_index, WireManager._make_junction_sexp(x, y))
-                    sheet_instances_index += 1
-                    added += 1
+        for iu_x, iu_y in to_add:
+            x = iu_x / _IU_PER_MM
+            y = iu_y / _IU_PER_MM
+            sch_data.insert(sheet_instances_index, WireManager._make_junction_sexp(x, y))
+            sheet_instances_index += 1
+            added += 1
 
         if added or removed:
             logger.info(f"sync_junctions: added {added}, removed {removed}")
@@ -764,8 +1036,10 @@ class WireManager:
                     break
 
             if sheet_instances_index is None:
-                logger.error("No sheet_instances section found in schematic")
-                return False
+                # Hierarchical sub-sheets have no (sheet_instances); append at
+                # the end, as add_label does. Returning False here made every
+                # no-connect on a child sheet fail.
+                sheet_instances_index = len(sch_data)
 
             # Insert no_connect
             sch_data.insert(sheet_instances_index, no_connect_sexp)
@@ -896,6 +1170,35 @@ class WireManager:
             sch_data = sexpdata.loads(sch_content)
 
             _LABEL_TYPES = {_SYM_LABEL, _SYM_GLOBAL_LABEL, _SYM_HIERARCHICAL_LABEL}
+
+            if position is None:
+                # Refuse a bare-name delete when the name is ambiguous: silently
+                # removing the first match has destroyed the wrong label before
+                # (the caller thought coordinates were being honoured). Report
+                # every candidate position so the caller can disambiguate.
+                candidates = []
+                for item in sch_data:
+                    if not (isinstance(item, list) and len(item) > 1 and item[0] in _LABEL_TYPES):
+                        continue
+                    if item[1] != net_name:
+                        continue
+                    at_entry = next(
+                        (
+                            p
+                            for p in item[1:]
+                            if isinstance(p, list) and len(p) >= 3 and p[0] == _SYM_AT
+                        ),
+                        None,
+                    )
+                    if at_entry is not None:
+                        candidates.append((float(at_entry[1]), float(at_entry[2])))
+                if len(candidates) > 1:
+                    listing = ", ".join(f"({x}, {y})" for x, y in candidates)
+                    raise ValueError(
+                        f"Label '{net_name}' appears {len(candidates)} times "
+                        f"(at {listing}); pass position to select which one to delete"
+                    )
+
             for i, item in enumerate(sch_data):
                 if not (isinstance(item, list) and len(item) > 0 and item[0] in _LABEL_TYPES):
                     continue
@@ -931,6 +1234,10 @@ class WireManager:
             logger.warning(f"No matching label found for '{net_name}'")
             return False
 
+        except ValueError:
+            # Ambiguity refusal — propagate so the caller sees the candidate
+            # positions instead of a generic "not found".
+            raise
         except Exception as e:
             logger.error(f"Error deleting label: {e}")
             import traceback
@@ -1062,15 +1369,9 @@ class WireManager:
     ) -> bool:
         """Add a free-form text annotation (SCH_TEXT) to a KiCad schematic."""
         try:
-            # KiCad's parser rejects raw newlines inside quoted string literals,
-            # so escape them along with backslashes and quotes. Order matters:
-            # backslashes first, otherwise we double-escape our own escapes.
-            text_escaped = (
-                text.replace("\\", "\\\\")
-                .replace('"', '\\"')
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-            )
+            # KiCad's parser rejects raw newlines inside quoted string literals;
+            # the shared helper escapes them with backslashes and quotes.
+            text_escaped = escape_sexpr_string(text)
             uid = str(uuid.uuid4())
             font_attrs = f"\n\t\t\t\t(size {font_size} {font_size})"
             if bold:
@@ -1138,25 +1439,17 @@ class WireManager:
 
         Returns (modified_content, success).
         """
-        # KiCad 7-9 stores the property as "Sheetname"; KiCad 10 renamed it
-        # to "Sheet name" (with space). Match either to stay compatible.
+        # KiCad writes the property as "Sheetname"; add_hierarchical_sheet
+        # wrote "Sheet name" (with a space) before #437. Match either. The
+        # name is compared in its escaped form, as it appears in the file.
         sheetname_pattern = re.compile(
-            r'\(property\s+"Sheet\s?name"\s+"' + re.escape(sheet_name) + r'"'
+            r'\(property\s+"Sheet\s?name"\s+"' + re.escape(escape_sexpr_string(sheet_name)) + r'"'
         )
 
         # \b keeps (sheet_instances from matching ("_" is a word character).
         for match in re.finditer(r"\(sheet\b", content):
             start = match.start()
-            depth = 0
-            end = -1
-            for i in range(start, len(content)):
-                if content[i] == "(":
-                    depth += 1
-                elif content[i] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        end = i  # index of the block's closing ")"
-                        break
+            end = match_paren(content, start)  # index of the block's closing ")"
             if end == -1:
                 break  # unbalanced parens; nothing sane to do
             if not sheetname_pattern.search(content, start, end):

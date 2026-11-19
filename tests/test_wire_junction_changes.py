@@ -332,7 +332,12 @@ class TestPinSnapping:
         with patch.object(KiCADInterface, "__init__", lambda self, *a, **kw: None):
             iface = KiCADInterface.__new__(KiCADInterface)
 
-        with patch("commands.wire_manager.WireManager.add_wire", return_value=True) as mw:
+        with (
+            patch("commands.wire_manager.WireManager.add_wire", return_value=True) as mw,
+            # add_schematic_wire loads via the guarded SchematicManager
+            # loader, whose Schematic binding lives in commands.schematic.
+            patch("commands.schematic.Schematic", skip_mod.Schematic),
+        ):
             result = iface._handle_add_schematic_wire(
                 {
                     "schematicPath": str(self.sch_path),
@@ -381,8 +386,14 @@ class TestPinSnapping:
                 }
             )
             assert result["success"] is True
-            # No snapping info in message
-            assert "snapped" not in result.get("message", "")
+            # Coordinates reach the writer unchanged, and the response says
+            # so instead of staying silent about the missed snap (#404).
+            assert mw.call_args[0][1] == [100.0, 100.0]
+            assert mw.call_args[0][2] == [200.0, 100.0]
+            assert result["endpoints"]["start"]["snapped"] is False
+            assert result["endpoints"]["end"]["snapped"] is False
+            assert len(result["warnings"]) == 2
+            assert "Warning:" in result["message"]
 
     @patch("commands.wire_manager.WireManager.add_polyline_wire", return_value=True)
     def test_intermediate_waypoints_not_snapped(self, mock_poly: Any) -> None:

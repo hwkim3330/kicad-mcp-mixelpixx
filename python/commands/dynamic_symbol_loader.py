@@ -14,7 +14,27 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from utils.sexpr_format import (
+    QUOTED_VALUE,
+    QUOTED_VALUE_SKIP,
+    escape_sexpr_string,
+    match_paren,
+    paren_delta,
+    unescape_sexpr_string,
+)
+from utils.sheet_tree import instance_paths, project_name
+from utils.symbol_instances import references_for_new_symbol
+
 logger = logging.getLogger("kicad_interface")
+
+#: First schematic file-format version that accepts ``(body_style ...)`` and
+#: ``(in_pos_files ...)`` inside a placed ``(symbol ...)``. Both tokens are
+#: KiCad 10 additions: a KiCad 8 (20231120) or KiCad 9 (20250114) file never
+#: contains them, and those KiCad releases reject a schematic carrying a token
+#: they do not know with a bare "Failed to load schematic". KiCad 10 accepts a
+#: v9 file either way (kicad-cli 10.0.0), so gating on the file's declared
+#: version costs nothing there and keeps the file loadable everywhere else.
+_KICAD10_SCH_VERSION = 20260101
 
 # Module-level caches shared across DynamicSymbolLoader instances.
 # A fresh loader is created for every add_component call (see
@@ -66,6 +86,10 @@ class DynamicSymbolLoader:
     def __init__(self, project_path: Optional[Path] = None):
         self.symbol_cache = {}  # Cache: "lib:symbol" -> raw text block
         self.project_path = project_path  # Project directory for project-specific libraries
+        # (instance path, reference) of each use of the sheet, for the symbol
+        # create_component_instance placed last; more than one when the sheet
+        # is used more than once.
+        self.placed_instances: List[Tuple[str, str]] = []
 
     @staticmethod
     def clear_library_caches() -> None:
@@ -203,20 +227,15 @@ class DynamicSymbolLoader:
         return result
 
     def _global_sym_lib_table_paths(self) -> list:
-        """Candidate paths for the user-global sym-lib-table, newest version first."""
-        home = Path.home()
-        versions = ["10.0", "9.0", "8.0"]
-        bases = []
-        if os.name == "nt":
-            bases.append(home / "AppData" / "Roaming" / "kicad")
-        else:
-            bases.append(home / ".config" / "kicad")
-            bases.append(home / "Library" / "Preferences" / "kicad")  # macOS
-        candidates = []
-        for base in bases:
-            for v in versions:
-                candidates.append(base / v / "sym-lib-table")
-        return candidates
+        """The global sym-lib-table to search, as a list (empty when there is none).
+
+        Same discovery as ``SymbolLibraryManager``; see
+        ``library_tables.global_table_for_reading``.
+        """
+        from commands.library_tables import global_table_for_reading
+
+        table = global_table_for_reading("symbol")
+        return [table] if table is not None else []
 
     def _resolve_library_from_table(self, table_path: Path, library_name: str) -> Optional[Path]:
         """Parse a sym-lib-table file and return the resolved path for the given library nickname."""
@@ -298,15 +317,9 @@ class DynamicSymbolLoader:
         depth = 0
         end = None
         for i in range(start, len(lines)):
-            for ch in lines[i]:
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            if end is not None:
+            depth += paren_delta(lines[i])
+            if depth <= 0:
+                end = i
                 break
 
         if end is None:
@@ -345,11 +358,7 @@ class DynamicSymbolLoader:
             depth = 0
             item_start = i
             while i < n:
-                for ch in lines[i]:
-                    if ch == "(":
-                        depth += 1
-                    elif ch == ")":
-                        depth -= 1
+                depth += paren_delta(lines[i])
                 i += 1
                 if depth == 0:
                     break
@@ -601,18 +610,9 @@ class DynamicSymbolLoader:
         if lib_sym_start == -1:
             raise ValueError("No lib_symbols section found in schematic")
 
-        depth = 0
-        lib_sym_end = lib_sym_start
-        for i in range(lib_sym_start, len(content)):
-            if content[i] == "(":
-                depth += 1
-            elif content[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    lib_sym_end = i
-                    break
-        else:
-            raise ValueError("No lib_symbols section found in schematic")
+        lib_sym_end = match_paren(content, lib_sym_start)
+        if lib_sym_end == -1:
+            raise ValueError("The lib_symbols section in the schematic is not closed")
 
         # Insert the symbol block just before the closing ) of lib_symbols
         content = content[:lib_sym_end] + "\n    " + indented_block + "\n  " + content[lib_sym_end:]
@@ -628,16 +628,8 @@ class DynamicSymbolLoader:
     @staticmethod
     def _extract_paren_block(text: str, start: int) -> str:
         """Return the substring from text[start] up to and including the matching closing paren."""
-        depth, i = 0, start
-        while i < len(text):
-            if text[i] == "(":
-                depth += 1
-            elif text[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-            i += 1
-        return text[start:]
+        end = match_paren(text, start)
+        return text[start : end + 1] if end != -1 else text[start:]
 
     def _extract_lib_property_positions(
         self,
@@ -646,10 +638,14 @@ class DynamicSymbolLoader:
         symbol_name: str,
     ) -> dict:
         """
-        Return {prop_name: (dx, dy, text_angle, effects_str)} from the lib_symbols
-        section of the schematic (which must already have the symbol injected).
+        Return {prop_name: (dx, dy, text_angle, effects_str, hidden)} from the
+        lib_symbols section of the schematic (which must already have the symbol
+        injected).
         effects_str is the full '(effects ...)' string to be reused in the placed
-        instance so that justify, font size, hide etc. are preserved.
+        instance so that justify, font size etc. are preserved; ``hidden`` carries
+        the library's field visibility separately, because the hide marker is
+        stripped out of effects_str (KiCad 10 records visibility as a top-level
+        ``(hide yes)`` on the property, not inside ``(effects ...)``).
         Returns an empty dict on failure.
         """
         try:
@@ -673,7 +669,10 @@ class DynamicSymbolLoader:
             search_pos = 0
             while True:
                 m = re.search(
-                    r'\(property\s+"([^"]+)"\s+"[^"]*"\s+\(at\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)',
+                    r"\(property\s+" + QUOTED_VALUE + r"\s+"
+                    # Non-capturing: the value is not needed here, and a
+                    # capturing form would shift the coordinate groups below.
+                    + QUOTED_VALUE_SKIP + r"\s+\(at\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)",
                     sym_block[search_pos:],
                 )
                 if not m:
@@ -681,7 +680,7 @@ class DynamicSymbolLoader:
                 abs_start = search_pos + m.start()
                 prop_block = self._extract_paren_block(sym_block, abs_start)
 
-                name = m.group(1)
+                name = unescape_sexpr_string(m.group(1))
                 dx = float(m.group(2))
                 dy = float(m.group(3))
                 angle = float(m.group(4))
@@ -690,16 +689,28 @@ class DynamicSymbolLoader:
                 eff_pos = prop_block.find("(effects")
                 if eff_pos != -1:
                     effects_str = self._extract_paren_block(prop_block, eff_pos)
-                    # Strip (hide ...) sub-expressions — visibility will be set
-                    # separately by the caller
+                    # Strip (hide ...) sub-expressions — visibility travels
+                    # separately in the `hidden` flag below
                     effects_str = re.sub(r"\s*\(hide\s+[^)]+\)", "", effects_str)
                     effects_str = effects_str.strip()
                 else:
                     effects_str = "(effects (font (size 1.27 1.27)))"
 
+                # Library field visibility. Both spellings occur in the wild:
+                # KiCad 10 writes a top-level (hide yes) on the property, older
+                # libraries put `hide` (bare token or parenthesised) inside
+                # (effects ...). Either means "don't draw this field".
+                # Blank the quoted values first: a field whose *value* contains
+                # the word "hide" must not be mistaken for a hidden field.
+                prop_tokens = re.sub(QUOTED_VALUE, '""', prop_block)
+                hidden = bool(
+                    re.search(r"\(hide\s+yes\)", prop_tokens)
+                    or re.search(r"\s+hide(?=[\s)])", prop_tokens)
+                )
+
                 # Only store the first occurrence (top-level lib property, not sub-symbol)
                 if name not in result:
-                    result[name] = (dx, dy, angle, effects_str)
+                    result[name] = (dx, dy, angle, effects_str, hidden)
 
                 search_pos = abs_start + 1
 
@@ -727,125 +738,63 @@ class DynamicSymbolLoader:
     # Instance-block helpers (project name, hierarchical path, pin uuids) #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _read_root_uuid(content: str) -> str:
-        """Return a schematic's own top-level (uuid ...) value, or '' if absent."""
-        m = re.search(r'\(uuid\s+"?([0-9a-fA-F-]+)"?\)', content)
-        return m.group(1) if m else ""
-
     def _resolve_project_name(self, schematic_path: Path) -> str:
         """Return the KiCad project name recorded in (instances (project "<name>" ...)).
 
         KiCad uses the project (``.kicad_pro``) stem, not the literal string
-        ``"project"``. Derive it from the nearest ``.kicad_pro`` (searching the
-        schematic's directory then a few parents), falling back to the schematic's
-        own stem when no project file is found.
+        ``"project"``: the nearest ``.kicad_pro`` in the schematic's directory or
+        a few parents, else the schematic's own stem (utils.sheet_tree).
+        """
+        return project_name(Path(schematic_path))
+
+    @staticmethod
+    def _read_sch_version(content: str) -> Optional[int]:
+        """Return the ``(version NNNNNNNN)`` token of a schematic, or None.
+
+        The file's own declared version — not the installed KiCad version —
+        decides which tokens are legal, because KiCad dispatches to a parser per
+        format version. A KiCad 10 binary still refuses a v10-only token inside a
+        file that declares 20231120.
+        """
+        m = re.search(r"\(version\s+(\d+)\)", content)
+        return int(m.group(1)) if m else None
+
+    @classmethod
+    def _supports_kicad10_symbol_tokens(cls, content: str) -> bool:
+        """Whether this schematic accepts ``body_style`` / ``in_pos_files``.
+
+        Unknown/absent version is treated as KiCad 10 to preserve the previous
+        behaviour for freshly generated files, which is what the templates and
+        the create_schematic fallback emit.
+        """
+        version = cls._read_sch_version(content)
+        return version is None or version >= _KICAD10_SCH_VERSION
+
+    def _build_instance_paths(self, schematic_path: Path) -> List[str]:
+        """Return the instance path of every use of ``schematic_path``.
+
+        - Root / flat schematic: ``/<root-sheet-uuid>``, the schematic's own
+          top-level (uuid ...).
+        - Sheet in a hierarchy: one path per use, each the chain of uuids from
+          the root, ``/<root-uuid>/<sheet-block-uuid>[/...]``. A sheet placed
+          twice has two, as does a sheet placed once inside one placed twice.
+        - Unlinked sheet (no root reaches it yet): one level with the sheet's
+          own uuid; add_hierarchical_sheet -> fix_subsheet_instances adds the
+          real paths once it is linked.
+
+        The root is looked for in the sheet's directory and up to three parents
+        (utils.sheet_tree.root_candidates), so a sheet in a subdirectory of the
+        project finds it. ``create_schematic`` writes ``(sheet_instances ...)``
+        into every new file, so that block alone does not mark the root (#423).
         """
         try:
-            sch = Path(schematic_path).resolve()
-            search_dirs = [sch.parent] + list(sch.parent.parents)[:3]
-            for directory in search_dirs:
-                pros = sorted(directory.glob("*.kicad_pro"))
-                if pros:
-                    return pros[0].stem
-            return sch.stem
+            return instance_paths(Path(schematic_path))[1]
         except Exception:
-            return Path(schematic_path).stem
-
-    def _iter_child_sheets(self, content: str) -> List[Tuple[str, str]]:
-        """Yield (sheet_block_uuid, sheet_file_rel) for each (sheet ...) in a schematic.
-
-        Skips (sheet_instances ...) — its token has no whitespace after ``sheet``.
-        """
-        results: List[Tuple[str, str]] = []
-        for m in re.finditer(r"\(sheet(?=\s)", content):
-            block = self._extract_paren_block(content, m.start())
-            um = re.search(r'\(uuid\s+"?([0-9a-fA-F-]+)"?\)', block)
-            fm = re.search(r'\(property\s+"Sheet file"\s+"([^"]+)"', block)
-            if um and fm:
-                results.append((um.group(1), fm.group(1).replace("\\", "/")))
-        return results
-
-    def _find_root_schematic(self, target: Path) -> Optional[Path]:
-        """Find the project's root .kicad_sch (the one carrying (sheet_instances ...))."""
-        try:
-            directory = target.parent
-            for pro in sorted(directory.glob("*.kicad_pro")):
-                cand = directory / f"{pro.stem}.kicad_sch"
-                if cand.exists():
-                    return cand.resolve()
-            for cand in sorted(directory.glob("*.kicad_sch")):
-                try:
-                    if "(sheet_instances" in cand.read_text(encoding="utf-8"):
-                        return cand.resolve()
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return None
-
-    def _sheet_chain_to(self, root: Path, target: Path) -> List[str]:
-        """Return the UUID chain [root_uuid, sheet_block_uuid, ...] from root to target.
-
-        Walks the root project's sheet tree breadth-first. Returns [] if target is not
-        reachable from root.
-        """
-        try:
-            root = root.resolve()
-            target = target.resolve()
-            root_content = root.read_text(encoding="utf-8")
-            root_uuid = self._read_root_uuid(root_content)
-            if not root_uuid:
-                return []
-            if root == target:
-                return [root_uuid]
-            visited = {root}
-            queue: List[Tuple[Path, str, List[str]]] = [(root, root_content, [root_uuid])]
-            while queue:
-                fpath, fcontent, chain = queue.pop(0)
-                for block_uuid, rel in self._iter_child_sheets(fcontent):
-                    child = (fpath.parent / rel).resolve()
-                    new_chain = chain + [block_uuid]
-                    if child == target:
-                        return new_chain
-                    if child.exists() and child not in visited:
-                        visited.add(child)
-                        try:
-                            queue.append((child, child.read_text(encoding="utf-8"), new_chain))
-                        except Exception:
-                            continue
-            return []
-        except Exception:
-            return []
+            return ["/"]
 
     def _build_instance_path(self, schematic_path: Path) -> str:
-        """Return the symbol instance path for symbols placed in ``schematic_path``.
-
-        - Root / flat schematic (carries (sheet_instances ...)): ``/<root-sheet-uuid>``
-          where the UUID is the schematic's own top-level (uuid ...).
-        - Child sheet in a hierarchy: the chain of sheet-instance UUIDs from the root,
-          ``/<root-uuid>/<sheet-block-uuid>[/...]``, reconstructed by walking the root
-          project's sheet tree.
-        - Unlinked child (no chain yet): one level using the sheet's own UUID;
-          add_hierarchical_sheet -> fix_subsheet_instances repairs it once linked.
-        """
-        try:
-            target = Path(schematic_path).resolve()
-            content = target.read_text(encoding="utf-8")
-            this_uuid = self._read_root_uuid(content)
-
-            if "(sheet_instances" in content and this_uuid:
-                return f"/{this_uuid}"
-
-            root = self._find_root_schematic(target)
-            if root is not None:
-                chain = self._sheet_chain_to(root, target)
-                if chain:
-                    return "/" + "/".join(chain)
-
-            return f"/{this_uuid}" if this_uuid else "/"
-        except Exception:
-            return "/"
+        """The first of ``_build_instance_paths``: the path of the sheet's first use."""
+        return self._build_instance_paths(schematic_path)[0]
 
     def _extract_symbol_pins(
         self, schematic_path: Path, library_name: str, symbol_name: str, unit: int
@@ -903,8 +852,10 @@ class DynamicSymbolLoader:
             if sym_start == -1:
                 return None
             sym_block = self._extract_paren_block(content, sym_start)
-            m = re.search(r'\(property\s+"' + re.escape(prop_name) + r'"\s+"([^"]*)"', sym_block)
-            return m.group(1) if m else None
+            m = re.search(
+                r'\(property\s+"' + re.escape(prop_name) + r'"\s+' + QUOTED_VALUE, sym_block
+            )
+            return unescape_sexpr_string(m.group(1)) if m else None
         except Exception:
             return None
 
@@ -965,19 +916,26 @@ class DynamicSymbolLoader:
         def _prop_at(
             name: str, fallback_dx: float, fallback_dy: float, fallback_angle: float = 0
         ) -> tuple:
-            """Return (abs_x, abs_y, text_angle, effects_str) for a property."""
+            """Return (abs_x, abs_y, text_angle, effects_str, hidden) for a property."""
             if name in lib_props:
-                dx, dy, text_ang, eff = lib_props[name]
+                dx, dy, text_ang, eff, hidden = lib_props[name]
             else:
                 dx, dy, text_ang, eff = fallback_dx, fallback_dy, fallback_angle, _DEFAULT_EFFECTS
+                hidden = False
             rdx, rdy = self._rotate_offset(dx, dy, angle)
-            return round(x + rdx, 3), round(y + rdy, 3), text_ang, eff
+            return round(x + rdx, 3), round(y + rdy, 3), text_ang, eff, hidden
 
-        ref_x, ref_y, ref_a, ref_eff = _prop_at("Reference", 2.032, 0, 0)
-        val_x, val_y, val_a, val_eff = _prop_at("Value", 0, 2.54, 0)
-        fp_x, fp_y, fp_a, fp_eff = _prop_at("Footprint", 0, 0, 0)
-        ds_x, ds_y, ds_a, ds_eff = _prop_at("Datasheet", 0, 0, 0)
-        desc_x, desc_y, desc_a, desc_eff = _prop_at("Description", 0, 0, 0)
+        # Reference/Value inherit the library's visibility. Power symbols
+        # (power:GND, power:+3V3, …) hide Reference by convention — the #PWR101
+        # designators are meaningless to a reader — and losing that flag on
+        # placement printed one stray designator beside every ground symbol.
+        # Footprint/Datasheet/Description stay hidden unconditionally, matching
+        # what eeschema writes on placement.
+        ref_x, ref_y, ref_a, ref_eff, ref_hide = _prop_at("Reference", 2.032, 0, 0)
+        val_x, val_y, val_a, val_eff, val_hide = _prop_at("Value", 0, 2.54, 0)
+        fp_x, fp_y, fp_a, fp_eff, _ = _prop_at("Footprint", 0, 0, 0)
+        ds_x, ds_y, ds_a, ds_eff, _ = _prop_at("Datasheet", 0, 0, 0)
+        desc_x, desc_y, desc_a, desc_eff, _ = _prop_at("Description", 0, 0, 0)
 
         def _fmt(n: float) -> str:
             """Format a coordinate the way KiCad does: integral values without a
@@ -1008,8 +966,13 @@ class DynamicSymbolLoader:
             Field order: at, [hide yes], show_name no, do_not_autoplace no, effects.
             """
             hide_line = "      (hide yes)\n" if hide else ""
+            # Escape both: library property values legitimately contain quotes
+            # (power:GND's Description is `... global label with name "GND"`),
+            # and emitted raw the inner quote closes the token early, splitting
+            # one value into three s-expression atoms (#324/#336).
             return (
-                f'    (property "{name}" "{value}"\n'
+                f'    (property "{escape_sexpr_string(name)}"'
+                f' "{escape_sexpr_string(value)}"\n'
                 f"      (at {_fmt(px)} {_fmt(py)} {_fmt(pa)})\n"
                 f"{hide_line}"
                 f"      (show_name no)\n"
@@ -1032,10 +995,24 @@ class DynamicSymbolLoader:
             or ""
         )
 
+        # Footprint inherits from the library symbol the same way (#300): the
+        # library value is the default KiCad itself applies on placement, and
+        # most callers pass nothing. An explicit argument still wins. The
+        # extractor is the escape-aware one (#348), so a footprint containing
+        # a quote inherits intact and the escaping writer below (#324) emits
+        # it correctly.
+        if not footprint:
+            footprint = (
+                self._extract_lib_property_value(
+                    schematic_path, library_name, symbol_name, "Footprint"
+                )
+                or ""
+            )
+
         properties_str = "\n".join(
             [
-                _property("Reference", reference, ref_x, ref_y, ref_a, ref_eff, False),
-                _property("Value", value or symbol_name, val_x, val_y, val_a, val_eff, False),
+                _property("Reference", reference, ref_x, ref_y, ref_a, ref_eff, ref_hide),
+                _property("Value", value or symbol_name, val_x, val_y, val_a, val_eff, val_hide),
                 _property("Footprint", footprint, fp_x, fp_y, fp_a, fp_eff, True),
                 _property("Datasheet", ds_val, ds_x, ds_y, ds_a, ds_eff, True),
                 _property("Description", desc_val, desc_x, desc_y, desc_a, desc_eff, True),
@@ -1047,35 +1024,60 @@ class DynamicSymbolLoader:
         pin_numbers = self._extract_symbol_pins(schematic_path, library_name, symbol_name, unit)
         pins_str = "\n".join(f'    (pin "{n}" (uuid "{uuid.uuid4()}"))' for n in pin_numbers)
 
-        # Real project name + hierarchical sheet path (not the "project" / "/" placeholders).
-        project_name = self._resolve_project_name(schematic_path)
-        instance_path = self._build_instance_path(schematic_path)
-        instances_str = (
-            "    (instances\n"
-            f'      (project "{project_name}"\n'
-            f'        (path "{instance_path}"\n'
-            f'          (reference "{reference}")\n'
+        # Real project name + hierarchical sheet path (not the "project" / "/"
+        # placeholders), one (path ...) per use of the sheet (#428). A sheet
+        # used twice needs a reference of its own in each use: with a single
+        # entry, the second use has none, and the netlist loses one part and
+        # lists another twice. The first use gets the requested reference.
+        instance_project = self._resolve_project_name(schematic_path)
+        try:
+            instances = references_for_new_symbol(Path(schematic_path), reference, instance_project)
+        except Exception as e:
+            logger.warning(f"Instance paths for {schematic_path} not resolved ({e}); using '/'")
+            instances = [("/", reference)]
+        self.placed_instances = instances
+        path_entries = "".join(
+            f'        (path "{escape_sexpr_string(path)}"\n'
+            f'          (reference "{escape_sexpr_string(ref)}")\n'
             f"          (unit {unit})\n"
             "        )\n"
+            for path, ref in instances
+        )
+        instances_str = (
+            "    (instances\n"
+            f'      (project "{escape_sexpr_string(instance_project)}"\n'
+            f"{path_entries}"
             "      )\n"
             "    )"
         )
 
         body = "\n".join(part for part in [properties_str, pins_str, instances_str] if part)
 
+        with open(schematic_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Emit the KiCad 10-only symbol attributes only into files whose declared
+        # format version accepts them (#351). A KiCad 8 or 9 file never contains
+        # them and those releases refuse a schematic carrying a token they do not
+        # know. Everything else on this line is common to v8/v9/v10.
+        if self._supports_kicad10_symbol_tokens(content):
+            attrs_line = (
+                "    (body_style 1) (exclude_from_sim no) (in_bom yes) (on_board yes)"
+                " (in_pos_files yes) (dnp no)\n"
+            )
+        else:
+            attrs_line = "    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)\n"
+
         mirror_str = " (mirror y)" if mirror_y else ""
         instance_block = (
-            f'  (symbol (lib_id "{full_lib_id}") (at {_fmt(x)} {_fmt(y)} {_fmt(angle)})'
+            f'  (symbol (lib_id "{escape_sexpr_string(full_lib_id)}")'
+            f" (at {_fmt(x)} {_fmt(y)} {_fmt(angle)})"
             f"{mirror_str} (unit {unit})\n"
-            "    (body_style 1) (exclude_from_sim no) (in_bom yes) (on_board yes)"
-            " (in_pos_files yes) (dnp no)\n"
+            f"{attrs_line}"
             f'    (uuid "{new_uuid}")\n'
             f"{body}\n"
             "  )"
         )
-
-        with open(schematic_path, "r", encoding="utf-8") as f:
-            content = f.read()
 
         # Insert before (sheet_instances using direct string search.
         # This works for both pretty-printed and sexpdata-compacted single-line files.

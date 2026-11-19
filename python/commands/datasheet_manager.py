@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from utils.sexpr_format import QUOTED_VALUE, paren_delta, unescape_sexpr_string
+
 logger = logging.getLogger("kicad_interface")
 
 LCSC_DATASHEET_URL = "https://www.lcsc.com/datasheet/{lcsc}.pdf"
@@ -62,18 +64,9 @@ class DatasheetManager:
         for i, line in enumerate(lines):
             if "(lib_symbols" in line and lib_sym_start is None:
                 lib_sym_start = i
-                depth = 0
-                for ch in line:
-                    if ch == "(":
-                        depth += 1
-                    elif ch == ")":
-                        depth -= 1
+                depth = paren_delta(line)
             elif lib_sym_start is not None and lib_sym_end is None:
-                for ch in line:
-                    if ch == "(":
-                        depth += 1
-                    elif ch == ")":
-                        depth -= 1
+                depth += paren_delta(line)
                 if depth == 0:
                     lib_sym_end = i
                     break
@@ -97,14 +90,14 @@ class DatasheetManager:
         for k in range(block_start, block_end + 1):
             line = lines[k]
 
-            lcsc_match = re.search(r'\(property\s+"LCSC"\s+"([^"]*)"', line)
+            lcsc_match = re.search(r'\(property\s+"LCSC"\s+' + QUOTED_VALUE, line)
             if lcsc_match:
-                lcsc_value = lcsc_match.group(1)
+                lcsc_value = unescape_sexpr_string(lcsc_match.group(1))
 
-            ds_match = re.search(r'\(property\s+"Datasheet"\s+"([^"]*)"', line)
+            ds_match = re.search(r'\(property\s+"Datasheet"\s+' + QUOTED_VALUE, line)
             if ds_match:
                 datasheet_line_idx = k
-                datasheet_current = ds_match.group(1)
+                datasheet_current = unescape_sexpr_string(ds_match.group(1))
 
         return {
             "lcsc": lcsc_value,
@@ -171,20 +164,11 @@ class DatasheetManager:
             # Detect placed symbol: (symbol (lib_id "...")
             if re.match(r"\s*\(symbol\s+\(lib_id\s+\"", line):
                 block_start = i
-                block_depth = 0
-                for ch in line:
-                    if ch == "(":
-                        block_depth += 1
-                    elif ch == ")":
-                        block_depth -= 1
+                block_depth = paren_delta(line)
 
                 j = i + 1
                 while j < len(new_lines) and block_depth > 0:
-                    for ch in new_lines[j]:
-                        if ch == "(":
-                            block_depth += 1
-                        elif ch == ")":
-                            block_depth -= 1
+                    block_depth += paren_delta(new_lines[j])
                     if block_depth > 0:
                         j += 1
                     else:

@@ -28,6 +28,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from commands.symbol_creator import symbol_lib_header
+from utils.sexpr_format import escape_sexpr_string
+
 logger = logging.getLogger("kicad_interface")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -70,7 +73,8 @@ def _fmt(v: float) -> str:
 
 
 def _escape(s: str) -> str:
-    return str(s).replace('"', '\\"')
+    """Escape a value for an S-expression double-quoted token (#336)."""
+    return escape_sexpr_string(str(s))
 
 
 def _sanitize(s: str) -> str:
@@ -1103,8 +1107,13 @@ def generate_sym_lib(sym_geoms: List["_EagleSymGeom"], lib_path: str) -> None:
     lets KiCad resolve the symbols both from the embedded lib_symbols section
     and from this library file.
     """
+    version, generator_version = symbol_lib_header(os.path.dirname(lib_path))
     out: List[str] = []
-    out.append("(kicad_symbol_lib (version 20250114)" ' (generator "kicad_symbol_editor")\n')
+    out.append(
+        f"(kicad_symbol_lib (version {version})"
+        ' (generator "kicad_symbol_editor")\n'
+        f' (generator_version "{generator_version}")\n'
+    )
 
     for sg in sym_geoms:
         # In a .kicad_sym file the symbol name has NO library prefix — the
@@ -1372,7 +1381,9 @@ def generate_kicad_sch(
     sch_uuid = _uid()
     out: List[str] = []
 
-    out.append(f'(kicad_sch (version 20250114) (generator "KiCAD Schematic Editor")\n\n')
+    out.append(
+        '(kicad_sch (version 20260101) (generator "eeschema")' ' (generator_version "10.0")\n\n'
+    )
     out.append(f"  (uuid {sch_uuid})\n\n")
     out.append(f'  (paper "{paper}")\n\n')
 
@@ -1894,7 +1905,8 @@ class EagleCommands:
                 from utils.sexpr_format import prettify
 
                 text = Path(sch_out).read_text(encoding="utf-8")
-                Path(sch_out).write_text(prettify(text), encoding="utf-8", newline="\n")
+                with Path(sch_out).open("w", encoding="utf-8", newline="\n") as f:
+                    f.write(prettify(text))
                 logger.info("Prettified schematic: %s", sch_out)
             except Exception as e:
                 logger.warning("Schematic prettify skipped: %s", e)

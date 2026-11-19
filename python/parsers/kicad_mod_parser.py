@@ -20,6 +20,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from utils.sexpr_format import match_paren, unescape_sexpr_string
+
 logger = logging.getLogger("kicad_interface")
 
 
@@ -175,8 +177,8 @@ def _extract_pads(content: str) -> List[Dict[str, Any]]:
 
 
 def _unescape(s: str) -> str:
-    """Reverse KiCad S-expression string escaping."""
-    return s.replace('\\"', '"').replace("\\\\", "\\")
+    """Reverse KiCad S-expression string escaping (line breaks included)."""
+    return unescape_sexpr_string(s)
 
 
 def _extract_blocks(content: str, token: str) -> List[str]:
@@ -189,18 +191,9 @@ def _extract_blocks(content: str, token: str) -> List[str]:
 
     for match in pattern.finditer(content):
         start = match.start()
-        depth = 0
-        i = start
-        while i < len(content):
-            ch = content[i]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    blocks.append(content[start : i + 1])
-                    break
-            i += 1
+        end = match_paren(content, start)
+        if end != -1:
+            blocks.append(content[start : end + 1])
 
     return blocks
 

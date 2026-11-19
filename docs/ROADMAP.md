@@ -2,8 +2,8 @@
 
 **Vision:** Enable anyone to design professional PCBs through natural conversation with AI
 
-**Current Version:** 2.3.1
-**Last Updated:** 2026-07-05
+**Current Version:** 2.9.0
+**Last Updated:** 2026-07-28
 
 ---
 
@@ -23,7 +23,8 @@
 
 ### v2.0.0-alpha - Router and IPC (November-December 2025)
 
-- [x] Tool router pattern -- 70% AI context reduction
+- [x] Tool router pattern -- 70% AI context reduction (the gating half was
+      rolled back in 2026-03; see ROUTER_ARCHITECTURE.md)
 - [x] IPC backend for real-time KiCAD UI synchronization (21 commands)
 - [x] Hybrid SWIG/IPC backend with automatic fallback
 - [x] Comprehensive Windows support with automated setup
@@ -62,7 +63,8 @@
 
 ### Documentation Overhaul (In Progress)
 
-- [ ] Per-feature documentation for all 122 tools
+- [x] Generated tool inventory covering all 229 tools (`npm run docs:tools`)
+- [ ] Per-feature documentation for the tools that need more than one line
 - [ ] Architecture guide for contributors
 - [ ] End-to-end PCB design workflow guide
 - [ ] Documentation index

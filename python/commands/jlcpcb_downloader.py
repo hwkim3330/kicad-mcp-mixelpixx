@@ -62,16 +62,41 @@ def _progress(progress: ProgressFn, message: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _parse_price_csv(raw: str) -> List[Dict[str, Any]]:
+    """Decode yaqwsx ``source-db-v2`` price CSV into ``[{"qty","price"}]``.
+
+    Format is ``qFrom-qTo:unitPrice`` segments joined by commas, where an empty
+    ``qTo`` means the break is open-ended, e.g.::
+
+        1-199:0.0189,200-599:0.0163,20000-:0.0138
+
+    Malformed segments are skipped rather than discarding the whole row.
+    """
+    out: List[Dict[str, Any]] = []
+    for segment in raw.split(","):
+        range_text, sep, price_text = segment.strip().partition(":")
+        if not sep:
+            continue
+        q_from = range_text.partition("-")[0]
+        try:
+            out.append({"qty": int(q_from), "price": float(price_text)})
+        except ValueError:
+            continue
+    out.sort(key=lambda brk: brk["qty"])
+    return out
+
+
 def normalize_price_json(raw: Any) -> str:
     """Normalize a source price value into the manager's ``[{"qty","price"}]`` shape.
 
-    Handles both CDFER/jlcparts JSON arrays (``[{"qFrom","qTo","price"}, ...]``)
-    and a bare scalar price. Returns a JSON string (``"[]"`` when no price).
+    Handles CDFER/legacy-jlcparts JSON arrays (``[{"qFrom","qTo","price"}, ...]``),
+    the yaqwsx ``source-db-v2`` price CSV (``qFrom-qTo:unitPrice,...``), and a bare
+    scalar price. Returns a JSON string (``"[]"`` when no price).
     """
     if raw is None or raw == "":
         return json.dumps([])
 
-    # JSON array string (CDFER / jlcparts store price as TEXT JSON)
+    # JSON array string (CDFER / legacy jlcparts store price as TEXT JSON)
     if isinstance(raw, str) and raw.strip().startswith("["):
         try:
             arr = json.loads(raw)
@@ -87,6 +112,10 @@ def normalize_price_json(raw: Any) -> str:
             qty = item.get("qFrom", item.get("qty", 1)) or 1
             out.append({"qty": qty, "price": price})
         return json.dumps(out)
+
+    # yaqwsx source-db-v2 CSV ("1-199:0.0189,200-:0.0138")
+    if isinstance(raw, str) and ":" in raw:
+        return json.dumps(_parse_price_csv(raw))
 
     # Scalar numeric price
     try:
@@ -117,32 +146,36 @@ def _relation_names(src: sqlite3.Connection) -> List[str]:
 
 
 def _ensure_components_view(src: sqlite3.Connection) -> None:
-    """Create a denormalized ``v_components`` view for yaqwsx-style sources.
+    """Create a denormalized ``v_components`` view for the yaqwsx full catalog.
 
-    CDFER ships a ``v_components`` view, but yaqwsx's raw ``cache.sqlite3`` (the
-    FULL catalog) stores category/manufacturer as IDs in sibling ``categories``
-    and ``manufacturers`` tables. Without this join the full-catalog convert
-    would leave category/subcategory/manufacturer blank. We build the same view
-    shape CDFER exposes so the rest of the converter is source-agnostic.
+    CDFER ships a ``v_components`` view, but yaqwsx's ``cache.sqlite3`` (the FULL
+    catalog, ``meta.format = 'source-db-v2'``) keeps components in
+    ``jlc_components`` with a ``lcsc_components`` side table. We build the same
+    view shape CDFER exposes so the rest of the converter is source-agnostic.
+
+    That layout arrived in upstream commit "Introduce compact source cache"
+    (2026-05-31), which also renamed the flags this converter relies on: the
+    ``basic`` column became ``library_type`` (``'base'``/``'expand'``), and a
+    blank ``manufacturer`` falls back to ``lcsc_components``. The join mirrors
+    upstream's own read query (``iterCategoryComponents``), incl. the
+    ``present = 1`` filter that hides delisted parts.
     """
     names = _relation_names(src)
-    if "v_components" in names:
-        return
-    if not ({"components", "categories", "manufacturers"} <= set(names)):
-        return
-    comp_cols = {r[1] for r in src.execute("PRAGMA table_info([components])").fetchall()}
-    if not ({"category_id", "manufacturer_id"} <= comp_cols):
+    if "v_components" in names or "jlc_components" not in names:
         return
     try:
         src.execute("""
             CREATE TEMP VIEW v_components AS
-            SELECT c.*, cat.category AS category, cat.subcategory AS subcategory,
-                   m.name AS manufacturer
-            FROM components c
-            LEFT JOIN categories cat ON cat.id = c.category_id
-            LEFT JOIN manufacturers m ON m.id = c.manufacturer_id
+            SELECT j.lcsc, j.category, j.subcategory, j.mfr, j.package, j.joints,
+                   COALESCE(NULLIF(j.manufacturer, ''), NULLIF(l.manufacturer, ''), '')
+                       AS manufacturer,
+                   CASE WHEN j.library_type = 'base' THEN 1 ELSE 0 END AS basic,
+                   j.preferred, j.description, j.datasheet, j.stock, j.price
+            FROM jlc_components j
+            LEFT JOIN lcsc_components l ON l.lcsc = j.lcsc
+            WHERE j.present = 1
             """)
-        logger.info("Built v_components join view for yaqwsx-style source")
+        logger.info("Built v_components join view for yaqwsx source-db-v2")
     except sqlite3.Error as exc:  # pragma: no cover - defensive
         logger.debug(f"could not build v_components view: {exc}")
 
@@ -357,7 +390,7 @@ def download_cdfer(
 
     _progress(
         progress,
-        "Downloading CDFER prebuilt SQLite (~1.5 GB)"
+        "Downloading CDFER prebuilt SQLite (~400 MB)"
         + (f" [catalog dated {last_modified}]" if last_modified else "")
         + "...",
     )
@@ -430,6 +463,27 @@ def _find_7z() -> Optional[str]:
     return resolve_7z()
 
 
+def _head(url: str) -> Dict[str, Any]:
+    """Status, Content-Length and Last-Modified of ``url``; {} if unreachable.
+
+    An empty result is not an error: the caller then simply downloads, and
+    curl reports any real failure.
+    """
+    import requests
+
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=30)
+    except requests.RequestException as exc:
+        logger.warning(f"HEAD {url} failed: {exc}")
+        return {}
+    length = resp.headers.get("Content-Length")
+    return {
+        "status": resp.status_code,
+        "size": int(length) if length and length.isdigit() else None,
+        "last_modified": resp.headers.get("Last-Modified"),
+    }
+
+
 def download_yaqwsx(cache_dir: Path, progress: ProgressFn = None) -> Path:
     """Download + extract the yaqwsx split 7z archive. Requires a 7z CLI."""
     import subprocess
@@ -441,7 +495,28 @@ def download_yaqwsx(cache_dir: Path, progress: ProgressFn = None) -> Path:
         raise RuntimeError("yaqwsx fallback requires curl which was not found")
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    _progress(progress, "Downloading yaqwsx split archive (~421 MB)...")
+    _progress(progress, "Downloading yaqwsx split archive (~230 MB)...")
+
+    # yaqwsx republishes the whole split archive every day, and every volume
+    # but the last is exactly 50 MiB, so volumes from different builds can't be
+    # told apart by size. Mixing them gives an archive 7z rejects (#454). The
+    # cache records which build it holds (cache.zip's Last-Modified) and is
+    # emptied when upstream has rebuilt.
+    zip_head = _head(f"{YAQWSX_BASE_URL}/cache.zip")
+    build = zip_head.get("last_modified") or ""
+    stamp = cache_dir / ".yaqwsx-build"
+    cached_build = stamp.read_text(encoding="utf-8").strip() if stamp.exists() else ""
+    if not build or build != cached_build:
+        for old in list(cache_dir.glob("cache.z*")) + [cache_dir / "cache.sqlite3"]:
+            if old.exists():
+                old.unlink()
+        if build:
+            stamp.write_text(build, encoding="utf-8")
+
+    def _complete(dst: Path, remote_size: Optional[int]) -> bool:
+        # Only a file of the published size is reused. Anything shorter is a
+        # download cut off part way (a timeout, a killed worker) and is resumed.
+        return dst.exists() and remote_size is not None and dst.stat().st_size == remote_size
 
     def _curl(url: str, dst: Path) -> bool:
         # -C - resumes a partial file; --retry handles transient stalls/drops.
@@ -480,15 +555,18 @@ def download_yaqwsx(cache_dir: Path, progress: ProgressFn = None) -> Path:
             break
         part = f"cache.z{i:02d}"
         dst = cache_dir / part
-        if dst.exists() and dst.stat().st_size > 1000:
+        head = _head(f"{YAQWSX_BASE_URL}/{part}")
+        if head.get("status") == 404:
+            if dst.exists():
+                dst.unlink()  # left over from a build with more volumes
+            break
+        if _complete(dst, head.get("size")):
             continue
         if not _curl(f"{YAQWSX_BASE_URL}/{part}", dst):
-            if dst.exists():
-                dst.unlink()
-            break
+            raise RuntimeError(f"failed to download yaqwsx {part}")
 
     zip_dst = cache_dir / "cache.zip"
-    if not (zip_dst.exists() and zip_dst.stat().st_size > 1000):
+    if not _complete(zip_dst, zip_head.get("size")):
         if not _curl(f"{YAQWSX_BASE_URL}/cache.zip", zip_dst):
             raise RuntimeError("failed to download yaqwsx cache.zip")
 
@@ -647,11 +725,20 @@ def download_database(
             errors.append(f"{src}: {exc}")
             continue
 
+    # Lead with what actually went wrong: the fixed advice used to be the whole
+    # message, so a yaqwsx failure with 7z installed still said "install 7z"
+    # and the real exception only reached the worker log (#454).
+    hints = []
+    if not _find_7z() and "yaqwsx" in order:
+        hints.append("install a 7z CLI for the yaqwsx source")
+    if "official" in order:
+        hints.append("set JLCPCB_APP_ID/JLCPCB_API_KEY/JLCPCB_API_SECRET for the official API")
+    message = "JLCPCB download failed: " + "; ".join(errors)
+    if hints:
+        message += ". To try other sources: " + ", or ".join(hints) + "."
     return {
         "success": False,
-        "message": "All JLCPCB download sources failed. "
-        "Install a 7z CLI for the yaqwsx fallback, or set JLCPCB_APP_ID/"
-        "JLCPCB_API_KEY/JLCPCB_API_SECRET for the official API.",
+        "message": message,
         "errors": errors,
     }
 

@@ -82,7 +82,8 @@ SAMPLE_LIB = """(kicad_symbol_lib
 
 def _write_lib(tmp_path: Path, name: str = "test.kicad_sym") -> Path:
     p = tmp_path / name
-    p.write_text(SAMPLE_LIB, encoding="utf-8", newline="\n")
+    with p.open("w", encoding="utf-8", newline="\n") as f:
+        f.write(SAMPLE_LIB)
     return p
 
 
@@ -106,7 +107,8 @@ def test_export_symbol(tmp_path):
     assert '(symbol "R_10K_0603"' in content
     assert '(symbol "C_100nF_0603"' not in content  # only the exported symbol
     assert content.startswith("(kicad_symbol_lib")
-    assert "(version 20241209)" in content  # same token every writer here uses
+    # No project here, so the header is the safe KiCad 9 fallback (PR #535).
+    assert "(version 20241209)" in content
     assert content.count("(") == content.count(")")
 
 

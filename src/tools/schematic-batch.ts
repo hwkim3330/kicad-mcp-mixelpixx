@@ -5,12 +5,13 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { reportsAppliedWork } from "./failure-as-error.js";
 
 export function registerSchematicBatchTools(server: McpServer, callKicadScript: Function) {
   // Add many components at once
   server.tool(
     "batch_add_components",
-    "Add multiple components to a schematic in one call (far fewer round-trips than add_schematic_component). Each component: {symbol:'Library:Name', reference, value?, footprint?, position:{x,y}, rotation?, includePins?}. Reference/Value fields are auto-positioned outside the body (disable with auto_position_fields=false). Returns per-component snapped position, field positions, body_bbox, and an overall placement_bbox.",
+    "Add multiple components to a schematic in one call (far fewer round-trips than add_schematic_component). Each component: {symbol:'Library:Name', reference, value?, footprint?, position:{x,y}, rotation?, includePins?, unit?}. Multi-unit parts are placed one entry per unit, sharing a reference. Reference/Value fields are auto-positioned outside the body (disable with auto_position_fields=false). Returns per-component snapped position, field positions, body_bbox, and an overall placement_bbox.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       components: z
@@ -23,6 +24,14 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
             position: z.object({ x: z.number(), y: z.number() }).optional(),
             rotation: z.number().optional(),
             includePins: z.boolean().optional(),
+            unit: z
+              .number()
+              .int()
+              .optional()
+              .describe(
+                "Unit of a multi-unit part (1=A, 2=B, …), default 1. Place each unit " +
+                  "as its own entry, all sharing the same reference.",
+              ),
           }),
         )
         .describe("Components to place"),
@@ -37,7 +46,7 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
     async (args: any) => {
       const r = await callKicadScript("batch_add_components", args);
       if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [`Added ${r.added_count} component(s), ${r.error_count} error(s).`];
       for (const e of r.errors || []) lines.push(`  ✗ ${e.reference} (${e.symbol}): ${e.error}`);
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -57,7 +66,7 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
     async (args: any) => {
       const r = await callKicadScript("batch_edit_schematic_components", args);
       if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [`Updated ${r.updated_count}, ${r.error_count} error(s).`];
       for (const e of r.errors || []) lines.push(`  ✗ ${e.reference}: ${e.error}`);
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -152,7 +161,9 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
     async (args: any) => {
       const r = await callKicadScript("replace_instance_lib_ids", args);
       if (r.success === false)
-        return { content: [{ type: "text", text: `Failed: ${r.error || r.message || "Unknown error"}` }] };
+        return {
+          content: [{ type: "text", text: `Failed: ${r.error || r.message || "Unknown error"}` }],
+        };
       return { content: [{ type: "text", text: r.message }] };
     },
   );
@@ -192,8 +203,10 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
     },
     async (args: any) => {
       const r = await callKicadScript("batch_add_no_connects", args);
-      if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+      // A partial batch answers success=false with the pins it did write in `placed`: that is not
+      // an error, or an agent retries and writes those pins a second time.
+      if (r.success === false && r.message && !reportsAppliedWork(r))
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [r.message];
       for (const f of r.failed || []) lines.push(`  ✗ ${f.componentRef}/${f.pinName}: ${f.reason}`);
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -203,22 +216,37 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
   // Net labels on many pins
   server.tool(
     "batch_connect",
-    "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. If a facing label for the same net is nearby, a wire is drawn instead of a duplicate label. Set replace=true to clear any existing label at a pin first. Warns about power nets missing a PWR_FLAG.",
+    "Place net labels on multiple pins in one call to wire nets quickly. 'connections' is a map {reference: {pin: netName}} where pin is a number or name. labelType selects 'label' (sheet-local, the default) or 'global_label' (connects across all sheets by name — use this for power rails and any net that spans sheets). For local labels, if a facing label for the same net is nearby a wire is drawn instead of a duplicate label; global labels are placed one-per-pin since they join their net by name. Set replace=true to clear any existing label at a pin first. Warns about power nets missing a PWR_FLAG.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       connections: z
         .record(z.string(), z.record(z.string(), z.string()))
         .describe("Map of reference -> {pin: netName}"),
+      labelType: z
+        .enum(["label", "global_label"])
+        .optional()
+        .default("label")
+        .describe(
+          "Label kind: 'label' = sheet-local (default); 'global_label' = connects across all sheets by name",
+        ),
       replace: z
         .boolean()
         .optional()
         .default(false)
         .describe("Delete existing labels at each pin before placing (default false)"),
+      stubLength: z
+        .number()
+        .optional()
+        .describe(
+          "Draw a wire this long (mm) out of each pin and put the label at its end, so the label doesn't sit on the pin number and name. 2.54 is typical; default 0 (label on the pin).",
+        ),
     },
     async (args: any) => {
       const r = await callKicadScript("batch_connect", args);
-      if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+      // A partial batch answers success=false with the pins it did write in `placed`: that is not
+      // an error, or an agent retries and writes those pins a second time.
+      if (r.success === false && r.message && !reportsAppliedWork(r))
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [r.message];
       for (const f of r.failed || []) lines.push(`  ✗ ${f.ref}/${f.pin}: ${f.reason}`);
       for (const w of r.warnings || []) lines.push(`  ⚠ ${w}`);
@@ -229,7 +257,7 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
   // Place + wire in one call
   server.tool(
     "batch_add_and_connect",
-    "Place multiple components AND wire their nets in a single call — the fewest-round-trip way to build a subcircuit. Each component is like batch_add_components plus an optional 'nets' map {pin: netName}. Components are placed first, then nets are connected via batch_connect.",
+    "Place multiple components AND wire their nets in a single call — the fewest-round-trip way to build a subcircuit. Each component is like batch_add_components plus an optional 'nets' map {pin: netName}. Components are placed first, then nets are connected via batch_connect. labelType selects 'label' (sheet-local, default) or 'global_label' (cross-sheet by name) for all the nets wired in this call.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       components: z
@@ -248,13 +276,24 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
           }),
         )
         .describe("Components to place and connect"),
+      labelType: z
+        .enum(["label", "global_label"])
+        .optional()
+        .default("label")
+        .describe(
+          "Label kind used to wire the nets: 'label' = sheet-local (default); 'global_label' = cross-sheet by name",
+        ),
+      stubLength: z
+        .number()
+        .optional()
+        .describe("Wire stub (mm) between each pin and its label, as in batch_connect (default 0)"),
       origin_x: z.number().optional(),
       origin_y: z.number().optional(),
     },
     async (args: any) => {
       const r = await callKicadScript("batch_add_and_connect", args);
       if (r.success === false && r.message)
-        return { content: [{ type: "text", text: `Failed: ${r.message}` }] };
+        return { content: [{ type: "text", text: `Failed: ${r.message}` }], isError: true };
       const lines = [r.message];
       for (const e of r.errors || []) lines.push(`  ✗ add ${e.reference}: ${e.error}`);
       for (const f of r.failed_connections || [])

@@ -12,6 +12,9 @@ Each tool includes:
 
 from typing import Any, Dict
 
+from utils.duplicate_strategies import DEFAULT_DUPLICATE_STRATEGIES, DUPLICATE_STRATEGIES
+from utils.pin_types import PIN_STYLES, PIN_TYPES
+
 # =============================================================================
 # PROJECT TOOLS
 # =============================================================================
@@ -66,7 +69,17 @@ PROJECT_TOOLS = [
                 "save": {
                     "type": "boolean",
                     "description": "Save the board to disk before closing (default true). If false and there are unsaved changes, the close proceeds but the response warns they were discarded.",
-                }
+                },
+                "forceExternalChanges": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Save despite external changes to the loaded SWIG board file",
+                },
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Backward-compatible alias for forceExternalChanges",
+                },
             },
         },
     },
@@ -86,6 +99,10 @@ PROJECT_TOOLS = [
                     "type": "string",
                     "description": "Optional new path to save the board (if not provided, saves to current location)",
                 },
+                "path": {
+                    "type": "string",
+                    "description": "Alias for filename",
+                },
                 "force": {
                     "type": "boolean",
                     "default": False,
@@ -94,8 +111,75 @@ PROJECT_TOOLS = [
                         "changed externally since this session loaded it"
                     ),
                 },
+                "forceExternalChanges": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Explicit alias for force; takes precedence when both are provided",
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Replace an existing destination when saving to a different path",
+                },
             },
         },
+    },
+    {
+        "name": "open_board",
+        "title": "Open PCB Board",
+        "description": "Opens a specific .kicad_pcb file and refreshes MCP's in-memory board state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"boardPath": {"type": "string"}},
+            "required": ["boardPath"],
+        },
+    },
+    {
+        "name": "reload_board",
+        "title": "Reload PCB Board",
+        "description": "Reloads the current or specified .kicad_pcb from disk, discarding stale in-memory state.",
+        "inputSchema": {"type": "object", "properties": {"boardPath": {"type": "string"}}},
+    },
+    {
+        "name": "save_board",
+        "title": "Save PCB Board",
+        "description": "Saves the loaded board with the external disk-change guard.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "force": {"type": "boolean", "default": False},
+                "forceExternalChanges": {"type": "boolean", "default": False},
+                "overwrite": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "save_as",
+        "title": "Save Board As",
+        "description": "Saves the loaded board to a new .kicad_pcb path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "overwrite": {"type": "boolean", "default": False},
+                "force": {"type": "boolean", "default": False},
+                "forceExternalChanges": {"type": "boolean", "default": False},
+            },
+            "required": ["boardPath"],
+        },
+    },
+    {
+        "name": "is_dirty",
+        "title": "Board Dirty State",
+        "description": "Reports whether MCP knows the loaded board has unsaved memory changes or external disk changes.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "discard_or_reload",
+        "title": "Discard or Reload Board",
+        "description": "Discards the in-memory board and reloads it from disk.",
+        "inputSchema": {"type": "object", "properties": {"boardPath": {"type": "string"}}},
     },
     {
         "name": "snapshot_project",
@@ -154,6 +238,57 @@ BOARD_TOOLS = [
         },
     },
     {
+        "name": "set_board_origin",
+        "title": "Set Board Aux/Grid Origin",
+        "description": (
+            "Set the auxiliary (drill/place) origin and/or grid origin of a "
+            ".kicad_pcb. The aux origin is the datum used by export_drill's "
+            "drillOrigin:'plot' option and by pick-and-place / plot exports "
+            "with useAuxOrigin."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pcb file",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": ["aux", "grid", "both"],
+                    "description": "Which origin to set (default: aux)",
+                    "default": "aux",
+                },
+                "x": {"type": "number", "description": "Origin X coordinate"},
+                "y": {"type": "number", "description": "Origin Y coordinate"},
+                "unit": {
+                    "type": "string",
+                    "enum": ["mm", "mil", "inch"],
+                    "description": "Coordinate unit (default: mm)",
+                    "default": "mm",
+                },
+            },
+            "required": ["boardPath", "x", "y"],
+        },
+    },
+    {
+        "name": "get_board_origin",
+        "title": "Get Board Aux/Grid Origin",
+        "description": (
+            "Read back the auxiliary (drill/place) origin and grid origin of a " ".kicad_pcb in mm."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pcb file",
+                },
+            },
+            "required": ["boardPath"],
+        },
+    },
+    {
         "name": "add_board_outline",
         "title": "Add Board Outline",
         "description": "Adds a board outline shape (rectangle, rounded_rectangle, circle, or polygon) on the Edge.Cuts layer. By default the board top-left corner is placed at (0, 0) so all coordinates are positive. Use x/y to set a different top-left corner position.",
@@ -206,23 +341,113 @@ BOARD_TOOLS = [
         },
     },
     {
-        "name": "add_layer",
-        "title": "Add Custom Layer",
-        "description": "Adds a new custom layer to the board stack (e.g., User.1, User.Comments).",
+        "name": "clear_board_outline",
+        "title": "Clear Board Outline",
+        "description": "Deletes all Edge.Cuts graphic items from the current PCB.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "replace_board_outline",
+        "title": "Replace Board Outline",
+        "description": "Clears existing Edge.Cuts items and adds a new board outline.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "layerName": {
+                "shape": {
                     "type": "string",
-                    "description": "Name of the layer to add",
+                    "enum": ["rectangle", "rounded_rectangle", "circle", "polygon"],
                 },
-                "layerType": {
+                "width": {"type": "number"},
+                "height": {"type": "number"},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "radius": {"type": "number"},
+                "cornerRadius": {"type": "number"},
+                "points": {"type": "array"},
+                "unit": {"type": "string", "enum": ["mm", "mil", "inch"], "default": "mm"},
+            },
+            "required": ["shape"],
+        },
+    },
+    {
+        "name": "list_graphics",
+        "title": "List PCB Graphics",
+        "description": "Lists board drawing items, optionally filtered by layer.",
+        "inputSchema": {"type": "object", "properties": {"layer": {"type": "string"}}},
+    },
+    {
+        "name": "delete_graphic",
+        "title": "Delete PCB Graphic",
+        "description": "Deletes a board drawing item by KiCad UUID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"uuid": {"type": "string"}},
+            "required": ["uuid"],
+        },
+    },
+    {
+        "name": "update_graphic",
+        "title": "Update PCB Graphic",
+        "description": "Updates common board graphic properties by KiCad UUID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uuid": {"type": "string"},
+                "layer": {"type": "string"},
+                "width": {"type": "number"},
+                "start": {"type": "object"},
+                "end": {"type": "object"},
+                "center": {"type": "object"},
+                "position": {"type": "object"},
+                "text": {"type": "string"},
+                "unit": {"type": "string", "enum": ["mm", "mil", "inch"], "default": "mm"},
+            },
+            "required": ["uuid"],
+        },
+    },
+    {
+        "name": "add_layer",
+        "title": "Enable Copper Layer",
+        "description": (
+            "Enables a copper layer in the board stackup and gives it a name. "
+            "Copper layers only — KiCad's technical and user layers (silkscreen, "
+            "mask, courtyard, Dwgs.User, ...) are a fixed set that always exists "
+            "and cannot be added."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
                     "type": "string",
-                    "enum": ["signal", "power", "mixed", "jumper"],
-                    "description": "Type of layer (for copper layers)",
+                    "description": (
+                        "Name for the layer. Stored alongside KiCad's canonical name "
+                        "(e.g. name 'PWR' on In1.Cu is written as "
+                        '(4 "In1.Cu" signal "PWR")).'
+                    ),
+                },
+                "type": {
+                    "type": "string",
+                    "enum": ["copper", "signal", "power", "mixed", "jumper"],
+                    "description": "Copper layer type",
+                },
+                "position": {
+                    "type": "string",
+                    "enum": ["top", "bottom", "inner"],
+                    "description": "Which copper layer to target",
+                },
+                "number": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 30,
+                    "description": (
+                        "Inner-layer ORDINAL, 1-based: 1 = In1.Cu, 2 = In2.Cu. This is "
+                        "not a KiCad layer ID (In1.Cu's id is 4). Required when "
+                        "position is 'inner'. The response echoes the resolved "
+                        "canonicalName and id."
+                    ),
                 },
             },
-            "required": ["layerName"],
+            "required": ["name", "type", "position"],
         },
     },
     {
@@ -232,12 +457,12 @@ BOARD_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "layerName": {
+                "layer": {
                     "type": "string",
                     "description": "Name of the layer to make active (e.g., F.Cu, B.Cu, Edge.Cuts)",
                 }
             },
-            "required": ["layerName"],
+            "required": ["layer"],
         },
     },
     {
@@ -245,6 +470,89 @@ BOARD_TOOLS = [
         "title": "List Board Layers",
         "description": "Returns a list of all layers in the board with their properties.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_stackup",
+        "title": "Get Board Stackup",
+        "description": (
+            "Read the stackup from the saved board file, not the board open in memory. "
+            "Returns each copper, dielectric, mask, and silk entry with its thickness in "
+            "millimetres. A thickness the stackup editor has locked is returned as "
+            "thicknessMm plus thicknessLocked. Layer names are the names stored on the "
+            "board, so a renamed layer such as 'Top Side' is returned beside the canonical "
+            "F.Cu name. pcbnew does not expose the stackup, so this reads the "
+            "(stackup ...) section of the .kicad_pcb file. If an earlier save was refused, "
+            "the file can be older than the session. Pass expected to compare those rows "
+            "with a recipe in the same call."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "expected": {
+                    "type": "array",
+                    "description": "Rows to compare. Each row needs index or layer. Omit to only read.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer"},
+                            "layer": {"type": "string"},
+                            "type": {"type": "string"},
+                            "thicknessMm": {"type": "number"},
+                            "epsilonR": {"type": "number"},
+                        },
+                    },
+                },
+                "thicknessToleranceMm": {
+                    "type": "number",
+                    "description": "Allowed thickness difference in millimetres. Default 0.001.",
+                },
+                "epsilonTolerance": {
+                    "type": "number",
+                    "description": "Allowed relative-permittivity difference. Default 0.01.",
+                },
+            },
+        },
+    },
+    {
+        "name": "set_stackup_layer",
+        "title": "Set Stackup Layer",
+        "description": (
+            "Write one stackup row into the board file. Identify the row by index from "
+            "get_stackup or by a layer name such as F.Cu or the name stored on the board. "
+            "thicknessMm changes that row. epsilonR, lossTangent, and material apply only "
+            "to a dielectric. sublayer selects a dielectric piece and defaults to 0. "
+            "pcbnew cannot edit the stackup, so this rewrites the (stackup ...) section."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "description": "Row index from get_stackup"},
+                "layer": {
+                    "type": "string",
+                    "description": "Canonical name such as F.Cu, or the name stored on the board",
+                },
+                "sublayer": {
+                    "type": "integer",
+                    "description": "Dielectric sublayer. Defaults to 0",
+                },
+                "thicknessMm": {
+                    "type": "number",
+                    "description": "Thickness of this sublayer in millimetres",
+                },
+                "epsilonR": {
+                    "type": "number",
+                    "description": "Relative permittivity. Dielectric rows only",
+                },
+                "lossTangent": {
+                    "type": "number",
+                    "description": "Loss tangent. Dielectric rows only",
+                },
+                "material": {
+                    "type": "string",
+                    "description": "Material name. Dielectric rows only",
+                },
+            },
+        },
     },
     {
         "name": "get_board_info",
@@ -515,6 +823,20 @@ COMPONENT_TOOLS = [
         },
     },
     {
+        "name": "batch_move_components",
+        "title": "Batch Move Components",
+        "description": "Moves multiple PCB components transactionally and saves by default.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "moves": {"type": "object"},
+                "save": {"type": "boolean", "default": True},
+                "dryRun": {"type": "boolean", "default": False},
+            },
+            "required": ["moves"],
+        },
+    },
+    {
         "name": "rotate_component",
         "title": "Rotate Component",
         "description": "Rotates a component by specified angle. Rotation is cumulative with existing rotation.",
@@ -586,8 +908,49 @@ COMPONENT_TOOLS = [
     {
         "name": "get_component_list",
         "title": "List All Components",
-        "description": "Returns a list of all components on the board with their properties.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": (
+            "Returns components on the board. boundingBox keeps footprints whose anchor "
+            "is inside the rectangle. matchPadCenter also keeps a footprint when any pad "
+            "centre is inside. includePads adds each pad's number, net, and position. "
+            "layer matches the board name or the canonical name such as B.Cu."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer": {"type": "string", "description": "Filter by layer name, such as F.Cu"},
+                "boundingBox": {
+                    "type": "object",
+                    "description": "Inclusive rectangle. The footprint anchor must lie inside",
+                    "properties": {
+                        "x1": {"type": "number"},
+                        "y1": {"type": "number"},
+                        "x2": {"type": "number"},
+                        "y2": {"type": "number"},
+                        "unit": {"type": "string", "enum": ["mm", "mil", "inch"]},
+                    },
+                },
+                "matchPadCenter": {
+                    "type": "boolean",
+                    "description": "Also match a footprint when any pad centre is inside boundingBox",
+                },
+                "includePads": {
+                    "type": "boolean",
+                    "description": "Add pads with number, net, and position",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_component_geometry",
+        "title": "Get Component Geometry",
+        "description": "Returns separated footprint bboxes for body, pads, courtyard, keepout, fab, silk and text.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string"},
+                "refs": {"type": "array", "items": {"type": "string"}},
+            },
+        },
     },
     {
         "name": "find_component",
@@ -627,6 +990,35 @@ COMPONENT_TOOLS = [
         },
     },
     {
+        "name": "get_pads",
+        "title": "Get Pads",
+        "description": "Returns pads for one component, selected refs, or all components.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string"},
+                "refs": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "get_net_pads",
+        "title": "Get Net Pads",
+        "description": "Returns every pad attached to a net name or net code.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "net": {"type": "string"},
+                "netCode": {"type": "number"},
+                "unit": {
+                    "type": "string",
+                    "enum": ["mm", "mil", "inch"],
+                    "description": "Unit for positions, sizes and bounding boxes (default: mm)",
+                },
+            },
+        },
+    },
+    {
         "name": "get_pad_position",
         "title": "Get Pad Position",
         "description": "Returns the position and properties of a specific pad on a component.",
@@ -647,6 +1039,61 @@ COMPONENT_TOOLS = [
                 },
             },
             "required": ["reference"],
+        },
+    },
+    {
+        "name": "get_ratsnest",
+        "title": "Get Ratsnest",
+        "description": "Estimates ratsnest/airwire segments and lengths from current pad positions grouped by net.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "nets": {"type": "array", "items": {"type": "string"}},
+                "maxPadsPerNet": {"type": "number", "default": 128},
+            },
+        },
+    },
+    {
+        "name": "estimate_airwire_lengths",
+        "title": "Estimate Airwire Lengths",
+        "description": "Alias for get_ratsnest.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "nets": {"type": "array", "items": {"type": "string"}},
+                "maxPadsPerNet": {"type": "number", "default": 128},
+            },
+        },
+    },
+    {
+        "name": "check_placement_clearance",
+        "title": "Check Placement Clearance",
+        "description": "Classifies placement conflicts as body, courtyard, keepout, silk/text, or pad-clearance issues.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refs": {"type": "array", "items": {"type": "string"}},
+                "margin": {"type": "number", "default": 0},
+                "padClearance": {"type": "number", "default": 0},
+            },
+        },
+    },
+    {
+        "name": "move_footprint_text",
+        "title": "Move Footprint Text",
+        "description": "Moves a footprint Reference/Value/user text field without moving the footprint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string"},
+                "field": {"type": "string"},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "rotation": {"type": "number"},
+                "layer": {"type": "string"},
+                "visible": {"type": "boolean"},
+            },
+            "required": ["reference", "field"],
         },
     },
     {
@@ -1046,7 +1493,7 @@ ROUTING_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "netName": {
+                "name": {
                     "type": "string",
                     "description": "Name of the net (e.g., VCC, GND, SDA)",
                     "minLength": 1,
@@ -1056,7 +1503,7 @@ ROUTING_TOOLS = [
                     "description": "Optional net class to assign (must exist first)",
                 },
             },
-            "required": ["netName"],
+            "required": ["name"],
         },
     },
     {
@@ -1126,7 +1573,7 @@ ROUTING_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "uuid": {
+                "traceUuid": {
                     "type": "string",
                     "description": "UUID of a specific trace to delete",
                 },
@@ -1351,7 +1798,7 @@ ROUTING_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "uuid": {
+                "traceUuid": {
                     "type": "string",
                     "description": "UUID of the trace to modify",
                 },
@@ -1412,7 +1859,20 @@ ROUTING_TOOLS = [
         "name": "get_nets_list",
         "title": "List All Nets",
         "description": "Returns a list of all electrical nets defined on the board.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "includeStats": {
+                    "type": "boolean",
+                    "description": "Add per-net track count, total track length and via count",
+                },
+                "unit": {
+                    "type": "string",
+                    "enum": ["mm", "mil", "inch"],
+                    "description": "Unit for track lengths (default: mm)",
+                },
+            },
+        },
     },
     {
         "name": "create_netclass",
@@ -1449,13 +1909,63 @@ ROUTING_TOOLS = [
         },
     },
     {
+        "name": "set_net_color",
+        "title": "Set Net Color",
+        "description": "Sets or clears a net's display color override (PCB editor's 'Net colors' panel). Cosmetic only — does not affect routing or design rules.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "net": {"type": "string", "description": "Name of the net"},
+                "color": {
+                    "type": "string",
+                    "description": "Hex color, e.g. '#FF7D00'. Required unless clear is true.",
+                },
+                "clear": {
+                    "type": "boolean",
+                    "description": "If true, remove the color override and revert to the automatic/class color",
+                },
+            },
+            "required": ["net"],
+        },
+    },
+    {
+        "name": "add_copper_keepout",
+        "title": "Add Copper Keepout",
+        "description": "Creates a live rule area that prevents copper zone fill while allowing tracks, vias, pads and footprints.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string", "minLength": 1},
+                "name": {"type": "string", "minLength": 1},
+                "layers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+                "points": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                        },
+                        "required": ["x", "y"],
+                    },
+                    "minItems": 3,
+                },
+            },
+            "required": ["boardPath", "name", "layers", "points"],
+        },
+    },
+    {
         "name": "add_copper_pour",
         "title": "Add Copper Pour",
         "description": "Creates a copper pour/zone (typically for ground or power planes).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "netName": {
+                "net": {
                     "type": "string",
                     "description": "Net to connect this copper pour to (e.g., GND, VCC)",
                 },
@@ -1476,31 +1986,69 @@ ROUTING_TOOLS = [
                 },
                 "outline": {
                     "type": "array",
-                    "description": "Array of [x, y] points defining the pour boundary",
+                    "description": "Array of {x, y} points (mm) defining the pour boundary",
                     "items": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 2,
-                        "maxItems": 2,
+                        "type": "object",
+                        "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                        "required": ["x", "y"],
                     },
                     "minItems": 3,
                 },
+                "minWidth": {
+                    "type": "number",
+                    "description": "Minimum fill width in millimeters (default 0.2)",
+                },
+                "fillType": {
+                    "type": "string",
+                    "enum": ["solid", "hatched"],
+                    "description": "Fill style (default solid)",
+                },
+                "padConnection": {
+                    "type": "string",
+                    "enum": ["thermal", "solid", "none"],
+                    "description": "How pads of the zone's net connect (default thermal)",
+                },
             },
-            "required": ["netName", "layer", "outline"],
+            "required": ["net", "layer", "outline"],
         },
     },
     {
         "name": "route_differential_pair",
         "title": "Route Differential Pair",
-        "description": "Routes a differential signal pair with matched lengths and spacing.",
+        "description": (
+            "Routes a differential pair as two parallel straight segments. startPos and "
+            "endPos are the pair's centreline; looking from start to end on the board "
+            "(y down), the positive trace runs on the right and the negative on the "
+            "left, each offset by (gap + width) / 2."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "positiveName": {
+                "startPos": {
+                    "type": "object",
+                    "description": "Start of the pair's centreline",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "unit": {"type": "string", "enum": ["mm", "mil", "inch"]},
+                    },
+                    "required": ["x", "y"],
+                },
+                "endPos": {
+                    "type": "object",
+                    "description": "End of the pair's centreline",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "unit": {"type": "string", "enum": ["mm", "mil", "inch"]},
+                    },
+                    "required": ["x", "y"],
+                },
+                "positiveNet": {
                     "type": "string",
                     "description": "Positive signal net name",
                 },
-                "negativeName": {
+                "negativeNet": {
                     "type": "string",
                     "description": "Negative signal net name",
                 },
@@ -1511,21 +2059,10 @@ ROUTING_TOOLS = [
                 },
                 "gap": {
                     "type": "number",
-                    "description": "Gap between traces in millimeters",
-                },
-                "points": {
-                    "type": "array",
-                    "description": "Waypoints for the pair routing",
-                    "items": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 2,
-                        "maxItems": 2,
-                    },
-                    "minItems": 2,
+                    "description": "Edge-to-edge gap between the two traces in millimeters",
                 },
             },
-            "required": ["positiveName", "negativeName", "width", "gap", "points"],
+            "required": ["startPos", "endPos", "positiveNet", "negativeNet"],
         },
     },
 ]
@@ -1572,9 +2109,163 @@ LIBRARY_TOOLS = [
                     "type": "string",
                     "description": "Library name (e.g., Resistor_SMD, Connector_PinHeader)",
                     "minLength": 1,
-                }
+                },
+                "filter": {
+                    "type": "string",
+                    "description": (
+                        "Keep names containing this text (case-insensitive, * as a wildcard)"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of footprints to return",
+                    "minimum": 1,
+                },
             },
             "required": ["library"],
+        },
+    },
+    {
+        "name": "list_library_table",
+        "title": "List Library Table Entries",
+        "description": (
+            "Read a sym-lib-table or fp-lib-table: nickname, type, URI and description of "
+            "every registered library. Each URI is resolved through ${KIPRJMOD}, KiCad's "
+            "built-in library directories (KICAD*_SYMBOL_DIR and friends), the path "
+            "variables configured in kicad_common.json and the environment, and reported "
+            "alongside whether the file is actually there -- which is how a stale row left "
+            'over from a library migration shows itself. A (type "Table") row is flagged '
+            "as an indirection, with a count of the libraries it stands for."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tableType": {
+                    "type": "string",
+                    "enum": ["symbol", "footprint"],
+                    "default": "symbol",
+                    "description": "sym-lib-table ('symbol') or fp-lib-table ('footprint')",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global"],
+                    "default": "project",
+                    "description": "Project table (needs projectPath) or KiCad's user config",
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pro or its directory, for scope=project",
+                },
+                "tablePath": {
+                    "type": "string",
+                    "description": "Path to the table file itself, bypassing scope resolution",
+                },
+            },
+        },
+    },
+    {
+        "name": "remove_library_table_entry",
+        "title": "Remove Library Table Entry",
+        "description": (
+            "Remove one or more entries from a sym-lib-table or fp-lib-table by nickname -- "
+            "the counterpart to register_symbol_library / register_footprint_library. The "
+            "table is re-parsed before it is written, so an edit that would leave it "
+            "unbalanced is refused rather than saved; the write is atomic and the previous "
+            "contents are kept in a sibling .mcp-backups/ directory. Use dryRun first when "
+            "the target is scope='global', which every project on the machine loads. "
+            'Removing a (type "Table") row unregisters every library in the table it '
+            "points at, and the result says so."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tableType": {
+                    "type": "string",
+                    "enum": ["symbol", "footprint"],
+                    "default": "symbol",
+                    "description": "sym-lib-table ('symbol') or fp-lib-table ('footprint')",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global"],
+                    "default": "project",
+                    "description": "Project table (needs projectPath) or KiCad's user config",
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pro or its directory, for scope=project",
+                },
+                "tablePath": {
+                    "type": "string",
+                    "description": "Path to the table file itself, bypassing scope resolution",
+                },
+                "libraryName": {"type": "string", "description": "Nickname to remove"},
+                "libraryNames": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Several nicknames to remove in one pass",
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Report what would be removed without writing the table",
+                },
+            },
+            # A destructive tool with no required argument can be fired with none
+            # at all; at least one nickname has to be named.
+            "anyOf": [{"required": ["libraryName"]}, {"required": ["libraryNames"]}],
+        },
+    },
+    {
+        "name": "set_library_table_uri",
+        "title": "Repoint Library Table Entry",
+        "description": (
+            "Repoint an existing library-table entry at a different file, keeping its "
+            "nickname, type and description. Use it to move a project onto "
+            "${KIPRJMOD}-relative paths, or to follow a library that was relocated, without "
+            "unregistering and re-registering it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tableType": {
+                    "type": "string",
+                    "enum": ["symbol", "footprint"],
+                    "default": "symbol",
+                    "description": "sym-lib-table ('symbol') or fp-lib-table ('footprint')",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global"],
+                    "default": "project",
+                    "description": "Project table (needs projectPath) or KiCad's user config",
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pro or its directory, for scope=project",
+                },
+                "tablePath": {
+                    "type": "string",
+                    "description": "Path to the table file itself, bypassing scope resolution",
+                },
+                "libraryName": {
+                    "type": "string",
+                    "description": "Nickname of the entry to repoint",
+                },
+                "uri": {
+                    "type": "string",
+                    "description": (
+                        "New URI, e.g. ${KIPRJMOD}/../FOG_components.kicad_sym. Path variables "
+                        "are stored verbatim and only expanded to check the file exists."
+                    ),
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Report the new URI without writing the table",
+                },
+            },
+            "required": ["libraryName", "uri"],
         },
     },
     {
@@ -1622,7 +2313,7 @@ DESIGN_RULE_TOOLS = [
                     "type": "number",
                     "description": "Minimum via drill diameter in millimeters",
                 },
-                "microViaD iameter": {
+                "microViaDiameter": {
                     "type": "number",
                     "description": "Minimum micro-via diameter in millimeters",
                 },
@@ -1656,6 +2347,146 @@ DESIGN_RULE_TOOLS = [
         "description": "Returns a list of design rule violations from the most recent DRC run.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "assign_net_to_class",
+        "title": "Assign Net to Class",
+        "description": "Assigns an existing net to an existing net class to apply its design rules.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "net": {"type": "string", "description": "Name of the net"},
+                "netClass": {"type": "string", "description": "Name of the net class"},
+            },
+            "required": ["net", "netClass"],
+        },
+    },
+    {
+        "name": "audit_via_nets",
+        "title": "Audit Via Nets Against a Reference",
+        "description": (
+            "Compares every via's net in the saved board with a reference board (a "
+            ".kicad_pcb file or a git revision such as HEAD) and lists vias whose net "
+            "changed, plus vias added, removed or moved. KiCad can silently change a via's "
+            "net on save, and DRC does not flag it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": {
+                    "type": "string",
+                    "description": (
+                        "A .kicad_pcb path, or a git revision of the same board file "
+                        "(HEAD, HEAD~1, a sha)"
+                    ),
+                },
+                "boardPath": {
+                    "type": "string",
+                    "description": "Board file to audit; defaults to the loaded board's file",
+                },
+            },
+            "required": ["reference"],
+        },
+    },
+    {
+        "name": "check_clearance",
+        "title": "Check Clearance",
+        "description": "Checks the measured clearance between two PCB items against the board's minimum clearance design rule.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item1": {
+                    "type": "object",
+                    "description": "First item: {type, id?, reference?}",
+                },
+                "item2": {
+                    "type": "object",
+                    "description": "Second item: {type, id?, reference?}",
+                },
+            },
+            "required": ["item1", "item2"],
+        },
+    },
+    {
+        "name": "set_layer_constraints",
+        "title": "Set Layer Constraints",
+        "description": "Sets per-layer minimum track width, clearance, and via dimensions via a .kicad_dru custom rule.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer": {"type": "string", "description": "Layer name (e.g. 'F.Cu')"},
+                "minTrackWidth": {
+                    "type": "number",
+                    "description": "Minimum track width for this layer (mm)",
+                },
+                "minClearance": {
+                    "type": "number",
+                    "description": "Minimum clearance for this layer (mm)",
+                },
+                "minViaDiameter": {
+                    "type": "number",
+                    "description": "Minimum via diameter for this layer (mm)",
+                },
+                "minViaDrill": {
+                    "type": "number",
+                    "description": "Minimum via drill size for this layer (mm)",
+                },
+            },
+            "required": ["layer"],
+        },
+    },
+    {
+        "name": "set_voltage_clearance_rules",
+        "title": "Set Voltage Clearance Rules",
+        "description": (
+            "Writes clearance/creepage rules graded by working voltage between net classes "
+            "into a managed block of the board's .kicad_dru. A class's voltage is one number "
+            "(fixed potential) or [min, max] for a node that swings; the working voltage "
+            "between two classes is max(|maxA - minB|, |maxB - minA|). The spacing table's "
+            "voltage key must suit both columns (IEC 60664-1: clearance from impulse/peak, "
+            "creepage from RMS working voltage). KiCad 9 or newer; refused on KiCad 8."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "classes": {
+                    "type": "array",
+                    "description": (
+                        "[{name, voltage}]: potential per net class against the shared "
+                        "reference (V): a number for a fixed node, [min, max] for one that swings"
+                    ),
+                    "items": {"type": "object"},
+                },
+                "spacing": {
+                    "type": "array",
+                    "description": "[{upTo, clearance, creepage?}]: working voltage (V) to spacing (mm)",
+                    "items": {"type": "object"},
+                },
+                "pairs": {
+                    "type": "array",
+                    "description": "[{a, b, voltage}]: explicit working voltage between two classes",
+                    "items": {"type": "object"},
+                },
+                "otherNetsVoltage": {
+                    "type": ["number", "array", "null"],
+                    "description": (
+                        "Potential of nets in no listed class, a number or [min, max] "
+                        "(default 0); null skips those rules"
+                    ),
+                },
+                "excludeUnconnectedNets": {
+                    "type": "boolean",
+                    "description": (
+                        "Leave KiCad's unconnected-(...) nets (unwired pins) out of the 'other "
+                        "nets' rules (default false; an unwired pin of a low-voltage part sits "
+                        "near that part's potential and needs the full spacing)"
+                    ),
+                },
+                "boardPath": {"type": "string", "description": "Board .kicad_pcb"},
+                "dryRun": {"type": "boolean", "description": "Plan only, write nothing"},
+            },
+            "required": ["classes", "spacing"],
+        },
+    },
 ]
 
 # =============================================================================
@@ -1670,7 +2501,7 @@ EXPORT_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "outputPath": {
+                "outputDir": {
                     "type": "string",
                     "description": "Directory path for output files",
                 },
@@ -1685,7 +2516,7 @@ EXPORT_TOOLS = [
                     "default": True,
                 },
             },
-            "required": ["outputPath"],
+            "required": ["outputDir"],
         },
     },
     {
@@ -1852,7 +2683,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_wire",
         "title": "Draw Wire Between Pins",
-        "description": "Draws a wire on the schematic between two or more coordinate points. Always call get_schematic_pin_locations first to get the approximate pin coordinates, then pass them as the first and last waypoints. snapToPins (on by default) will correct any float imprecision by snapping endpoints to the exact nearest pin coordinate. To route around components, add intermediate waypoints between the start and end: e.g. [[x1,y1], [xMid,y1], [xMid,y2], [x2,y2]] routes horizontally then vertically. Intermediate waypoints are never snapped.",
+        "description": "Draws a wire on the schematic between two or more coordinate points. Always call get_schematic_pin_locations first to get the approximate pin coordinates, then pass them as the first and last waypoints. snapToPins (on by default) will correct any float imprecision by snapping endpoints to the exact nearest pin coordinate. To route around components, add intermediate waypoints between the start and end: e.g. [[x1,y1], [xMid,y1], [xMid,y2], [x2,y2]] routes horizontally then vertically. Intermediate waypoints are never snapped. The response says, for the start and end points, whether they snapped and how far the nearest pin is, and warns when an endpoint is outside snapTolerance of every pin: such a wire is floating.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2138,7 +2969,97 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Path to .kicad_pcb file. If omitted, uses currently loaded board.",
                 },
+                "dryRun": {
+                    "type": "boolean",
+                    "description": (
+                        "Report every change (pad nets, values, fields, footprints added) "
+                        "without saving. The sync overwrites board values and fields with the "
+                        "schematic's, so preview first on a board edited after its last sync."
+                    ),
+                },
+                "replaceFootprints": {
+                    "type": "boolean",
+                    "description": (
+                        "Swap footprints whose library ID differs from the symbol's footprint, keeping "
+                        "position, rotation, side and symbol link."
+                    ),
+                },
+                "deleteUnusedFootprints": {
+                    "type": "boolean",
+                    "description": (
+                        "Delete footprints with no symbol in the schematic; board-only and "
+                        "locked footprints are kept, and a footprint whose symbol UUID matches "
+                        "a schematic symbol is renamed to it (re-annotation), never deleted. "
+                        "Refused, like replaceFootprints, while the board is open in KiCad "
+                        "(session pinned to IPC) unless dryRun."
+                    ),
+                },
             },
+        },
+    },
+    {
+        "name": "backannotate_footprints",
+        "title": "Back-annotate Footprints (PCB to Schematic)",
+        "description": (
+            "Copy footprint assignments from a .kicad_pcb back into the schematic's "
+            "Footprint fields -- the reverse of sync_schematic_to_board. After a layout "
+            "pass the board is the side that is right: footprints get swapped in pcbnew, "
+            "and imported projects land with schematic-side fields that never matched the "
+            "placed parts. Matching is by reference designator, taken from each symbol's "
+            "(instances ...) block so a sheet placed more than once contributes all of its "
+            "designators; virtual references starting with '#' (power, ground) are skipped, "
+            "and every unit of a multi-unit symbol is updated. Only the quoted value is "
+            "rewritten, so field visibility, font and position survive. Nothing is written "
+            "for a reference the board uses twice, or for instances that share one Footprint "
+            "field but disagree on the board -- those are listed under 'conflicts'. "
+            "Footprints on the board with no matching symbol are listed under "
+            "'notInSchematic'. Instances missing a Footprint field get one added unless "
+            "addMissing is false. Use dryRun to see the diff first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string", "description": "Path to the .kicad_pcb file"},
+                "schematicPath": {
+                    "type": "string",
+                    "description": (
+                        "Single sheet to update. Omit to walk the sheet tree from the root "
+                        "schematic named after the board, which is what a hierarchical "
+                        "design needs; local history, backup copies and other projects "
+                        "under the same directory are left alone."
+                    ),
+                },
+                "references": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Limit the update to these reference designators",
+                },
+                "addMissing": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Add a Footprint field to instances that have none",
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Report the changes without writing them",
+                },
+            },
+            "required": ["boardPath"],
+        },
+    },
+    {
+        "name": "create_board_from_schematic",
+        "title": "Create Board From Schematic",
+        "description": "Creates a fresh .kicad_pcb file, then updates it from the schematic so footprints and nets are present.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {"type": "string"},
+                "boardPath": {"type": "string"},
+                "overwrite": {"type": "boolean", "default": False},
+            },
+            "required": ["schematicPath"],
         },
     },
     {
@@ -2258,6 +3179,25 @@ SCHEMATIC_TOOLS = [
         },
     },
     {
+        "name": "check_schematic_legibility",
+        "title": "Check Schematic Legibility",
+        "description": "Checks whether a person can read a schematic sheet: what ERC and a netlist cannot see. Boxes every symbol body, visible reference/value, label and free text and reports text over text (a symbol's own fields included), text over another symbol's body, a symbol's own field across a drawn line of its body (inside an IC's rectangle or beside a capacitor's plates is fine), body over body, a wire through a text (a label's own wire only touches its edge), items on the title block or outside the frame, and upside-down text. Each problem comes with its box in sheet mm; look at it with get_schematic_view_region.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch sheet to check (one sheet; check each sub-sheet separately)",
+                },
+                "maxProblems": {
+                    "type": "integer",
+                    "description": "Most problems to list (default 200); counts always cover all",
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
         "name": "get_elements_in_region",
         "title": "Get Elements in Region",
         "description": "Lists all symbols, wires, and labels within a rectangular region of the schematic. Useful for understanding what is in a specific area before modifying it.",
@@ -2291,7 +3231,15 @@ SCHEMATIC_TOOLS = [
     {
         "name": "find_wires_crossing_symbols",
         "title": "Find Wires Crossing Symbols",
-        "description": "Find all wires that cross over component symbol bodies. Wires passing over symbols are unacceptable in schematics — they indicate routing mistakes where a wire was drawn across a component instead of around it.",
+        "description": (
+            "Find all wires that cross over component symbol bodies. Wires passing over symbols are "
+            "unacceptable in schematics — they indicate routing mistakes where a wire was drawn across "
+            "a component instead of around it. "
+            "Also lists, under pinsOnWireInterior (with pinsOnWireInteriorCount), every symbol pin, "
+            "power pins included, that lies on the middle of a wire without being connected to it: "
+            "KiCad joins a pin to a wire only where the wire ends or where a junction sits on the pin, "
+            "so a label there does not connect it to the wire. collisions and count are unchanged."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2299,6 +3247,120 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Path to the .kicad_sch schematic file",
                 }
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "list_schematic_rectangles",
+        "title": "List Schematic Rectangles",
+        "description": (
+            "List the rectangles drawn on a schematic sheet: uuid, start and end corners "
+            "in mm, stroke and fill, plus radius and locked when KiCad wrote them. "
+            "Rectangles inside symbol bodies are not included."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                }
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "set_schematic_rectangle",
+        "title": "Create, Edit or Delete a Schematic Rectangle",
+        "description": (
+            "Without uuid, create a rectangle from start and end and return its uuid. "
+            "With uuid, change only the fields given. With uuid and delete: true, remove it. "
+            "An unknown uuid is an error. A corner radius is never written (KiCad 9 "
+            "cannot load one); an existing radius is kept."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                },
+                "uuid": {
+                    "type": "string",
+                    "description": "Rectangle to change or delete; leave out to create one",
+                },
+                "start": {
+                    "description": 'First corner in mm, as [x, y] or {"x": .., "y": ..}',
+                    "oneOf": [
+                        {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                            "required": ["x", "y"],
+                        },
+                    ],
+                },
+                "end": {
+                    "description": 'Opposite corner in mm, as [x, y] or {"x": .., "y": ..}',
+                    "oneOf": [
+                        {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                            "required": ["x", "y"],
+                        },
+                    ],
+                },
+                "stroke": {
+                    "type": "object",
+                    "description": "Outline style; a partial stroke keeps the rest",
+                    "properties": {
+                        "width": {"type": "number", "minimum": 0},
+                        "type": {
+                            "type": "string",
+                            "enum": ["default", "solid", "dash", "dot", "dash_dot", "dash_dot_dot"],
+                        },
+                        "color": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 4,
+                            "maxItems": 4,
+                            "description": "[r, g, b, a]: r, g, b from 0 to 255, a from 0 to 1",
+                        },
+                    },
+                },
+                "fill": {
+                    "type": "object",
+                    "description": "Fill style; type color needs color",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["none", "outline", "background", "color"],
+                        },
+                        "color": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 4,
+                            "maxItems": 4,
+                            "description": "[r, g, b, a]: r, g, b from 0 to 255, a from 0 to 1",
+                        },
+                    },
+                },
+                "delete": {
+                    "type": "boolean",
+                    "description": "With uuid: remove the rectangle",
+                },
             },
             "required": ["schematicPath"],
         },
@@ -2385,6 +3447,43 @@ SCHEMATIC_TOOLS = [
                         "type": "string",
                         "enum": ["wires", "junctions", "labels", "components"],
                     },
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "lint_offgrid",
+        "title": "Lint Off-Grid Schematic Geometry",
+        "description": (
+            "Report every off-grid connection-relevant coordinate in a schematic — "
+            "wire/bus endpoints, symbol origins, label/junction/no_connect anchors — "
+            "and optionally snap them to the nearest grid point (fix=true). "
+            "KiCad's connection grid is fixed at 50 mil (1.27 mm) and junction "
+            "placement uses exact matching, so a single off-grid endpoint can poison "
+            "junction placement for a whole sheet. Fixes are byte-exact text splices "
+            "that preserve file formatting; (lib_symbols) content and property field "
+            "positions are never touched. Offenders more than 0.5 mm off-grid are "
+            "reported as needsHuman and never auto-snapped."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                },
+                "fix": {
+                    "type": "boolean",
+                    "description": "Snap offenders in place (default false: report only)",
+                    "default": False,
+                },
+                "gridSize": {
+                    "type": "number",
+                    "description": (
+                        "Grid spacing in mm (default: 1.27 = 50 mil, the KiCad " "connection grid)"
+                    ),
+                    "default": 1.27,
                 },
             },
             "required": ["schematicPath"],
@@ -2525,8 +3624,10 @@ SCHEMATIC_TOOLS = [
         "title": "Add Property to Library Symbol",
         "description": (
             "Add or update a custom property on a symbol in a .kicad_sym library file. "
-            "This makes permanent library-wide changes. After adding properties, use "
-            "update_symbol_from_library to refresh schematics that reference the updated symbol."
+            "The property is written on the symbol itself, not on one of its units, so "
+            "multi-unit symbols are handled correctly. This makes permanent library-wide "
+            "changes. After adding properties, use update_symbol_from_library to refresh "
+            "schematics that reference the updated symbol."
         ),
         "inputSchema": {
             "type": "object",
@@ -2538,10 +3639,157 @@ SCHEMATIC_TOOLS = [
                 "position": {
                     "type": "object",
                     "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                    "description": (
+                        "Placement in mm. Omit to keep an existing property where it is "
+                        "(new properties default to 0, 0)."
+                    ),
                 },
-                "hide": {"type": "boolean", "default": False},
+                "hide": {
+                    "type": "boolean",
+                    "description": (
+                        "Hide the property. Omit to keep an existing property's current "
+                        "visibility (new properties default to visible)."
+                    ),
+                },
             },
             "required": ["libraryPath", "symbolName", "propertyName", "propertyValue"],
+        },
+    },
+    {
+        "name": "set_symbol_pin_type",
+        "title": "Set Pin Electrical Type in Symbol Library",
+        "description": (
+            "Set the electrical type (and optionally the graphic style) of pins in a "
+            ".kicad_sym library, filtered by symbol, pin number, pin name, or current type. "
+            "Use instead of a sed/regex pass over the library: a blind substitution also "
+            "rewrites matching words inside symbol names, Descriptions and (alternate ...) "
+            "pin functions, and cannot tell which symbol it is standing on. The replacement "
+            "token is validated first -- KiCAD refuses to load a library containing a pin "
+            "type it does not know. Typical use: imported or SnapEDA symbols arrive with "
+            "every pin 'unspecified' or 'bidirectional', flooding ERC with conflicts on nets "
+            "that are electrically fine. The library is replaced atomically, keeps its "
+            "existing line endings, and is copied to a sibling '.mcp-backups/' first "
+            "(path returned in 'backupPath'). 'changes' lists at most 200 per-pin records "
+            "with 'changesTruncated' saying when it was cut; 'changeCount' always carries "
+            "the true total."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "libraryPath": {"type": "string", "description": "Path to the .kicad_sym file"},
+                "type": {
+                    "type": "string",
+                    "enum": list(PIN_TYPES),
+                    "description": "New electrical type",
+                },
+                "style": {
+                    "type": "string",
+                    "enum": list(PIN_STYLES),
+                    "description": "New graphic style",
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Top-level symbol names to change (not unit names like "
+                        "'R_0402_1_1'). Omit to change every symbol in the library."
+                    ),
+                },
+                "pinNumbers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Only pins with these numbers",
+                },
+                "pinNames": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Only pins with these names",
+                },
+                "fromType": {
+                    "type": "string",
+                    "enum": list(PIN_TYPES),
+                    "description": (
+                        "Only pins currently of this type -- the safe way to do a bulk fix"
+                    ),
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Report what would change without writing",
+                },
+            },
+            "required": ["libraryPath"],
+        },
+    },
+    {
+        "name": "find_duplicate_symbols",
+        "title": "Find Duplicate Symbols in a Library",
+        "description": (
+            "Group symbols in a .kicad_sym that are the same part stored twice under "
+            "different names -- the residue of Eagle imports, SnapEDA downloads and parts "
+            "re-added because search did not find the existing name. KiCad reports nothing "
+            "here, because the names differ, which is also why grepping does not find it. "
+            "Matches on manufacturer part number (tolerating the inconsistent property "
+            "naming real libraries have: MPN, MP, 'MANUFACTURER PART NUMBER', 'PART "
+            "NUMBER'), on distributor part number, on Value+Footprint, on an identical "
+            "drawn body, or on near-identical names. Pass schematicPaths to count how many "
+            "instances each duplicate actually has, which turns the report into a decision: "
+            "the one nothing places is the one to retire."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "libraryPath": {"type": "string", "description": "Path to the .kicad_sym file"},
+                "matchBy": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(DUPLICATE_STRATEGIES)},
+                    "default": list(DEFAULT_DUPLICATE_STRATEGIES),
+                    "description": (
+                        "How to decide two symbols are the same part. 'graphics' is off by "
+                        "default: every resistor in a library shares one body, so on "
+                        "passives it groups the whole family. 'name' is off by default "
+                        "because matching names that differ only in separators is the "
+                        "weakest signal here. Values that only mark a field as unfilled "
+                        "(N/A, TBD, -, ~) are never used as a key."
+                    ),
+                },
+                "schematicPaths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        ".kicad_sch files or directories to scan for usage counts. "
+                        "Directories are searched recursively, skipping autosave sheets "
+                        "and backup/history folders, which are copies of sheets already "
+                        "being counted. Only placements of THIS library are counted (see "
+                        "libraryNicknames), and a sub-sheet instantiated more than once "
+                        "counts once per instantiation. Paths that do not exist come back "
+                        "in missingPaths rather than being silently ignored."
+                    ),
+                },
+                "libraryNicknames": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The nickname(s) this library is registered under in a lib_id, if "
+                        "the file stem and the sym-lib-table entries beside the scanned "
+                        "sheets do not cover it. Placements naming another library are not "
+                        "counted: a bare 'R' here is not Device:R. The result reports the "
+                        "nicknames used (libraryNicknames) and the ones actually found in "
+                        "the sheets (nicknamesSeen)."
+                    ),
+                },
+                "minGroupSize": {
+                    "type": "integer",
+                    "default": 2,
+                    "description": "Only report groups with at least this many symbols",
+                },
+                "ignoreCase": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Compare part numbers and values case-insensitively",
+                },
+            },
+            "required": ["libraryPath"],
         },
     },
     {
@@ -2621,8 +3869,524 @@ UI_TOOLS = [
 ]
 
 # =============================================================================
+# VALIDATION TOOLS
+# =============================================================================
+
+VALIDATION_TOOLS = [
+    {
+        "name": "validate_schematic",
+        "title": "Validate Schematic File",
+        "description": (
+            "Check that a .kicad_sch file is structurally sound, reporting the line and "
+            "column of every fault. kicad-cli only says whether a file loads; this says "
+            "where it broke. Catches unbalanced parens, unterminated strings, trailing "
+            "content, and property/effects fragments orphaned directly under (kicad_sch), "
+            "which is what a truncated property rewrite leaves behind. A paren fault that "
+            "nets to zero is caught too, by the first line whose indentation stops "
+            "agreeing with its nesting depth. kicad-cli is then run on a throwaway copy "
+            "as the authoritative answer, so the file being validated is never modified. "
+            "'column' counts characters, so a tab counts once and the number will be "
+            "lower than an editor's ruler shows on indented lines. Run this after any "
+            "tool that edits a schematic."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {"type": "string", "description": "Path to the .kicad_sch file"},
+                "runKicadCli": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Confirm with kicad-cli on a copy. Set false for a fast "
+                        "structure-only check, or when KiCad is not installed."
+                    ),
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "validate_symbol_library",
+        "title": "Validate Symbol Library File",
+        "description": (
+            "Check that a .kicad_sym file is structurally sound and will load, reporting "
+            "the line and column of every fault instead of a bare 'Unable to load "
+            "library'. Beyond paren/string structure it reports units whose names no "
+            "longer match their symbol (a rename that missed the NAME_0_1 sub-symbols "
+            "makes the whole library unloadable), (effects ...)/(at ...) fragments a "
+            "truncated property rewrite left inside a (symbol ...), units that escaped "
+            "their parent to the top level, and duplicate symbol names. kicad-cli is "
+            "run on a throwaway copy, so the library is never modified. 'column' counts "
+            "characters, so a tab counts once and the number will be lower than an "
+            "editor's ruler shows on indented lines. Run this after any tool that edits "
+            "a library."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "libraryPath": {"type": "string", "description": "Path to the .kicad_sym file"},
+                "runKicadCli": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Confirm with kicad-cli on a copy. Set false for a fast "
+                        "structure-only check, or when KiCad is not installed."
+                    ),
+                },
+            },
+            "required": ["libraryPath"],
+        },
+    },
+]
+
+# =============================================================================
+# DIGI-KEY TOOLS
+# =============================================================================
+
+# Credentials are read from DIGIKEY_CLIENT_ID / DIGIKEY_CLIENT_SECRET in the
+# server environment and are deliberately absent from these schemas, matching
+# src/tools/digikey-api.ts: an argument is recorded in the caller's transcript,
+# in the MCP log, and in anything that replays the call. Keep it that way when
+# extending these — tests/test_digikey.py asserts no credential-shaped property
+# appears here.
+
+_DIGIKEY_LOCALE_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Override the locale for this call. Digi-Key requires locale headers on every "
+        "request -- without them a search returns 404 -- but the values are yours to "
+        "pick. Defaults come from DIGIKEY_LOCALE_* or US/en/USD. The response is "
+        "localized too, so lifecycle status and packaging names come back in the "
+        "language requested; the tools compare ids rather than those strings."
+    ),
+    "properties": {
+        "site": {"type": "string", "description": "Digi-Key site, e.g. US, DE, UK"},
+        "language": {"type": "string", "description": "Language code, e.g. en, de"},
+        "currency": {"type": "string", "description": "Currency code, e.g. USD, EUR"},
+    },
+}
+
+_DIGIKEY_PACKAGING_SCHEMA = {
+    "type": "string",
+    "enum": ["TR", "CT", "DKR"],
+    "description": (
+        "Which packaging variation to quote as the headline part number: TR (tape & "
+        "reel, production), CT (cut tape, prototypes), DKR (Digi-Reel). Matching "
+        "handles localized packaging names."
+    ),
+}
+
+DIGIKEY_TOOLS = [
+    {
+        "name": "digikey_test_connection",
+        "title": "Test Digi-Key API Connection",
+        "description": (
+            "Verify that the server's Digi-Key credentials work: fetch a token and run "
+            "one search. Use this first when a Digi-Key tool reports an authentication "
+            "problem, since it distinguishes missing credentials from rejected ones from "
+            "a locale misconfiguration. Credentials come from DIGIKEY_CLIENT_ID and "
+            "DIGIKEY_CLIENT_SECRET in the server environment; they are never accepted as "
+            "arguments and never appear in a response."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"locale": _DIGIKEY_LOCALE_SCHEMA},
+        },
+    },
+    {
+        "name": "digikey_search_parts",
+        "title": "Search Digi-Key Parts",
+        "description": (
+            "Search Digi-Key by part number, manufacturer part number, or a parametric "
+            "phrase ('0402 100nF 50V X7R'), returning stock, price, lifecycle status, "
+            "packaging variations and the parametric table. Two details the raw API "
+            "makes easy to get wrong are handled here: the Digi-Key part number lives on "
+            "each packaging variation rather than on the product, so reel and cut tape "
+            "have different numbers; and lifecycle is read from ProductStatus.Id rather "
+            "than the status string, which is localized. Use preferPackaging to pick "
+            "which variation is quoted as the headline part number."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keywords": {
+                    "type": "string",
+                    "description": (
+                        "Part number, MPN, or a parametric phrase such as " "'0402 100nF 50V X7R'"
+                    ),
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Results to return, 1-50 (default 10)",
+                },
+                "offset": {
+                    "type": "number",
+                    "description": "Result offset for paging (default 0)",
+                },
+                "preferPackaging": _DIGIKEY_PACKAGING_SCHEMA,
+                "locale": _DIGIKEY_LOCALE_SCHEMA,
+            },
+            "required": ["keywords"],
+        },
+    },
+    {
+        "name": "digikey_check_library_availability",
+        "title": "Check Symbol Library Availability on Digi-Key",
+        "description": (
+            "Look up every symbol in a .kicad_sym on Digi-Key and report which parts are "
+            "obsolete, out of stock, unfindable, or missing a part number altogether -- "
+            "the check to run before a board goes to purchasing, and after inheriting a "
+            "library from an import. Each symbol is searched by its distributor part "
+            "number first and its manufacturer part number second, because retired "
+            "Digi-Key numbers are the common failure and the MPN usually still resolves; "
+            "searchByMpnFirst reverses that. Part numbers are read under any of the "
+            "property spellings real libraries use (MPN, MP, 'MANUFACTURER PART NUMBER', "
+            "'PART NUMBER', 'SUPPLIER PART NUMBER 1'). Budget up to two rate-limited "
+            "requests per symbol -- the fallback costs a second one whenever the first "
+            "term misses -- plus one token request, so raise maxSymbols deliberately."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "libraryPath": {
+                    "type": "string",
+                    "description": "Absolute path to the .kicad_sym library file",
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Only check these symbol names (default: every symbol in the " "library)"
+                    ),
+                },
+                "maxSymbols": {
+                    "type": "number",
+                    "default": 25,
+                    "description": (
+                        "Stop after this many symbols (default 25). Each symbol costs one "
+                        "or two rate-limited API requests and the client throttles itself "
+                        "between them, so a larger sweep takes minutes; raising this past "
+                        "a few hundred will exhaust even the extended timeout this tool "
+                        "runs under."
+                    ),
+                },
+                "searchByMpnFirst": {
+                    "type": "boolean",
+                    "description": (
+                        "Search by manufacturer part number before the distributor number"
+                    ),
+                },
+                "preferPackaging": _DIGIKEY_PACKAGING_SCHEMA,
+                "locale": _DIGIKEY_LOCALE_SCHEMA,
+            },
+            "required": ["libraryPath"],
+        },
+    },
+]
+
+# =============================================================================
 # COMBINED TOOL SCHEMAS
 # =============================================================================
+
+# Thin socket clients for the in-KiCad helper plugin (gui_driver_plugin/).
+# Requires KiCad running with the kicad-gui-driver plugin installed; the
+# AT-SPI variants are the Linux zero-in-KiCad fast path.
+
+_GUI_FRAME_PROP = {
+    "frame": {
+        "type": "string",
+        "description": "Optional frame name/title filter (e.g. 'PcbFrame', 'Schematic'). Defaults to the PCB editor.",
+    }
+}
+
+GUI_DRIVER_TOOLS = [
+    {
+        "name": "kicad_gui_tree",
+        "title": "Enumerate KiCad GUI (menus + toolbars)",
+        "description": (
+            "Enumerates the live KiCad GUI via the in-process helper: all menus/submenus "
+            "(name + wx id, including Tools > External Plugins entries) and AUI toolbars "
+            "(id + tooltip; toolbar buttons are icon-only). Destructive items carry "
+            "destructive:true and a leading '⚠ ' — advisory only, nothing is gated."
+        ),
+        "inputSchema": {"type": "object", "properties": {**_GUI_FRAME_PROP}},
+    },
+    {
+        "name": "kicad_gui_click",
+        "title": "Click a KiCad menu item / toolbar tool",
+        "description": (
+            "Activates a menu item or AUI toolbar tool by name (as shown by kicad_gui_tree; "
+            "the '⚠ ' prefix may be included or omitted) or by explicit wx id. Injects a real "
+            "wx command event on the UI thread — no pixel coordinates. NOT gated: destructive "
+            "items execute too."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Menu label or toolbar tooltip to activate.",
+                },
+                "id": {
+                    "type": "integer",
+                    "description": "Explicit wx item id (skips name resolution).",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["menu", "tool"],
+                    "description": "Item kind when passing an explicit id (default menu).",
+                },
+                **_GUI_FRAME_PROP,
+            },
+        },
+    },
+    {
+        "name": "kicad_run_action_plugin",
+        "title": "Run a KiCad action plugin",
+        "description": (
+            "Finds the Tools > External Plugins submenu entry with the given name "
+            "(e.g. 'Open kiHarness') and triggers it — end-to-end proof a plugin button works."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Plugin menu entry name."},
+                **_GUI_FRAME_PROP,
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "kicad_gui_wait_for",
+        "title": "Wait for a KiCad window/dialog",
+        "description": "Polls until a shown top-level window whose title contains `title` exists (or timeout).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Substring of the window title to wait for.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds to wait (default 10).",
+                    "default": 10,
+                },
+            },
+            "required": ["title"],
+        },
+    },
+    {
+        "name": "kicad_gui_screenshot",
+        "title": "Screenshot the KiCad frame",
+        "description": "Captures the driven frame's screen rectangle to a PNG and returns its path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path of the .png file to write, in a directory that already exists (a temp file if omitted).",
+                },
+                **_GUI_FRAME_PROP,
+            },
+        },
+    },
+    {
+        "name": "kicad_pcb_snapshot",
+        "title": "Playbook: Zoom-to-Fit + screenshot",
+        "description": "GUI playbook: triggers Zoom to Fit, waits for the repaint, screenshots the frame.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path of the .png file to write, in a directory that already exists (a temp file if omitted).",
+                },
+                "settle": {
+                    "type": "number",
+                    "description": "Seconds to wait after zoom (default 0.5).",
+                },
+                **_GUI_FRAME_PROP,
+            },
+        },
+    },
+    {
+        "name": "kicad_reload_and_open_plugin",
+        "title": "Playbook: refresh plugins + open one",
+        "description": (
+            "GUI playbook (the plugin dev/test loop): triggers Refresh Plugins, then the named "
+            "External-Plugins entry."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Plugin menu entry to open after the refresh.",
+                },
+                "settle": {
+                    "type": "number",
+                    "description": "Seconds to wait after refresh (default 1).",
+                },
+                **_GUI_FRAME_PROP,
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "kicad_run_drc",
+        "title": "Playbook: run DRC via the GUI dialog",
+        "description": (
+            "GUI playbook: opens the Design Rules Checker dialog, clicks 'Run DRC', then scrapes "
+            "the violations list (best-effort; always returns the raw widget scrape). Exercises "
+            "the dialog-driving path — for headless DRC use the plain run_drc tool instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dialogTitle": {
+                    "type": "string",
+                    "description": "Dialog title substring (default 'DRC').",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds to wait for the dialog (default 15).",
+                },
+                "runTimeout": {
+                    "type": "number",
+                    "description": "Seconds to wait for results (default 60).",
+                },
+                **_GUI_FRAME_PROP,
+            },
+        },
+    },
+    {
+        "name": "kicad_gui_tree_atspi",
+        "title": "Enumerate KiCad GUI via AT-SPI (Linux)",
+        "description": (
+            "Backend B: dumps KiCad's accessible widget tree (role + name) from the Linux a11y "
+            "bus — zero code inside KiCad. Needs toolkit-accessibility enabled and KiCad "
+            "launched with GTK_MODULES=gail:atk-bridge."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "app": {
+                    "type": "string",
+                    "description": "Accessible application name filter (default 'kicad').",
+                },
+                "maxDepth": {
+                    "type": "integer",
+                    "description": "Recursion depth limit (default 12).",
+                },
+            },
+        },
+    },
+    {
+        "name": "kicad_gui_click_atspi",
+        "title": "Click a KiCad widget via AT-SPI (Linux)",
+        "description": "Backend B: activates the first accessible node matching `name` (and optional role) via do_action(0).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Accessible name to activate."},
+                "role": {
+                    "type": "string",
+                    "description": "Optional role substring filter (e.g. 'push button', 'menu item').",
+                },
+                "app": {
+                    "type": "string",
+                    "description": "Accessible application name filter (default 'kicad').",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "install_gui_driver",
+        "title": "Install the GUI-driver helper (opt-in)",
+        "description": (
+            "Deploy the in-KiCad GUI-driver helper plugin into the user's KiCad plugin tree. "
+            "Opt-in: the connect path no longer installs it as a side effect of a failed connect. "
+            "After install, set KICAD_GUI_DRIVER_ENABLE=1 in KiCad's environment and restart "
+            "(or Tools > External Plugins > Refresh Plugins) to open the token-gated channel."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+# Read-only geometry for a PDN or EMC review. One entry per tool so a
+# later query can extend this list without changing the copper editor.
+ANALYSIS_TOOLS = [
+    {
+        "name": "summarize_vias",
+        "title": "Summarize Vias",
+        "description": (
+            "Count vias without listing them. Returns the via count, how many run "
+            "from F.Cu to B.Cu, a drill histogram, and the layer spans. Filter by "
+            "net, rectangle, drill, or layer name."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "net": {
+                    "type": "string",
+                    "description": "Only vias on this net, for example GND",
+                },
+                "boundingBox": {
+                    "type": "object",
+                    "description": "Only vias whose centre lies inside this rectangle",
+                    "properties": {
+                        "x1": {"type": "number"},
+                        "y1": {"type": "number"},
+                        "x2": {"type": "number"},
+                        "y2": {"type": "number"},
+                        "unit": {
+                            "type": "string",
+                            "enum": ["mm", "mil", "inch"],
+                            "default": "mm",
+                        },
+                    },
+                },
+                "drillMin": {
+                    "type": "number",
+                    "description": "Minimum drill diameter in millimetres, inclusive",
+                },
+                "drillMax": {
+                    "type": "number",
+                    "description": "Maximum drill diameter in millimetres, inclusive",
+                },
+                "startLayer": {
+                    "type": "string",
+                    "description": "Match the via start layer by board name or canonical name",
+                },
+                "endLayer": {
+                    "type": "string",
+                    "description": "Match the via end layer by board name or canonical name",
+                },
+            },
+        },
+    },
+    {
+        "name": "summarize_net_copper",
+        "title": "Summarize Net Copper",
+        "description": (
+            "Summarize one net's copper without listing every track, via, and zone. "
+            "Returns the three counts, the layers involved, the bounding box, and a "
+            "shape: vias_only, tracks_only, zones_only, empty, or mixed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "net": {
+                    "type": "string",
+                    "description": "Net name, for example GND or NetL2_1",
+                },
+            },
+            "required": ["net"],
+        },
+    },
+]
 
 TOOL_SCHEMAS: Dict[str, Any] = {}
 
@@ -2637,6 +4401,10 @@ for tool in (
     + EXPORT_TOOLS
     + SCHEMATIC_TOOLS
     + UI_TOOLS
+    + VALIDATION_TOOLS
+    + DIGIKEY_TOOLS
+    + GUI_DRIVER_TOOLS
+    + ANALYSIS_TOOLS
 ):
     TOOL_SCHEMAS[tool["name"]] = tool
 
